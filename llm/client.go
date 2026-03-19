@@ -83,6 +83,17 @@ type chatResponse struct {
 	} `json:"usage"`
 }
 
+// sharedTransport is a package-level HTTP transport shared across all LLM clients.
+// This enables TCP+TLS connection reuse (keep-alive), matching the behaviour of
+// Python's httpx connection pool.  Without sharing, each openAIClient would open
+// its own fresh connections and trigger DashScope's per-IP new-connection rate limit
+// under heavy concurrency.
+var sharedTransport = &http.Transport{
+	MaxIdleConns:        64,
+	MaxIdleConnsPerHost: 16,
+	IdleConnTimeout:     90 * time.Second,
+}
+
 func newOpenAIClient(baseURL, apiKey, model string, temperature float64, timeoutSeconds int, enableThinking bool) *openAIClient {
 	return &openAIClient{
 		baseURL:        strings.TrimRight(baseURL, "/"),
@@ -91,7 +102,10 @@ func newOpenAIClient(baseURL, apiKey, model string, temperature float64, timeout
 		temperature:    temperature,
 		timeoutSeconds: timeoutSeconds,
 		enableThinking: enableThinking,
-		httpClient:     &http.Client{Timeout: time.Duration(timeoutSeconds) * time.Second},
+		// No Timeout on the http.Client itself: callers pass a context with deadline,
+		// which is the correct Go idiom.  Setting Timeout here would race with the
+		// context deadline and produce confusing error messages.
+		httpClient: &http.Client{Transport: sharedTransport},
 	}
 }
 
