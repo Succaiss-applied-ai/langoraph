@@ -60,12 +60,16 @@ type openAIClient struct {
 
 // openAI wire types (minimal subset we need)
 type chatRequest struct {
-	Model          string         `json:"model"`
-	Messages       []Message      `json:"messages"`
-	Temperature    float64        `json:"temperature,omitempty"`
+	Model          string          `json:"model"`
+	Messages       []Message       `json:"messages"`
+	Temperature    float64         `json:"temperature,omitempty"`
 	ResponseFormat *responseFormat `json:"response_format,omitempty"`
-	Stream         bool           `json:"stream"`
-	ExtraBody      map[string]any `json:"extra_body,omitempty"`
+	Stream         bool            `json:"stream"`
+	// EnableThinking is a DashScope/DeepSeek top-level extension for Qwen3 thinking models.
+	// Python's openai SDK merges extra_body into the top-level request; Go must do the same.
+	// Sending it nested under "extra_body" is silently ignored by DashScope, causing the model
+	// to default to thinking=true and generate thousands of slow reasoning tokens.
+	EnableThinking *bool `json:"enable_thinking,omitempty"`
 }
 
 type responseFormat struct {
@@ -131,10 +135,14 @@ func (c *openAIClient) chat(ctx context.Context, messages []Message, jsonMode bo
 	if jsonMode {
 		req.ResponseFormat = &responseFormat{Type: "json_object"}
 	}
-	// DashScope / DeepSeek support enable_thinking via extra_body
+	// DashScope / DeepSeek: send enable_thinking as a TOP-LEVEL field.
+	// Python's openai SDK extra_body merges into top-level — we must do the same.
+	// Nesting it under "extra_body" key is silently ignored by DashScope, causing
+	// qwen3.5-flash to default to thinking=true and generate ~5000 slow reasoning tokens.
 	lower := strings.ToLower(c.baseURL)
 	if strings.Contains(lower, "dashscope") || strings.Contains(lower, "deepseek") {
-		req.ExtraBody = map[string]any{"enable_thinking": c.enableThinking}
+		t := c.enableThinking
+		req.EnableThinking = &t
 	}
 
 	body, err := json.Marshal(req)
@@ -172,13 +180,18 @@ func (c *openAIClient) chat(ctx context.Context, messages []Message, jsonMode bo
 		return nil, fmt.Errorf("llm: no choices in response")
 	}
 
-	return &Response{
+	r := &Response{
 		Content:         cr.Choices[0].Message.Content,
 		ThinkingContent: cr.Choices[0].Message.ReasoningContent,
 		InputTokens:     cr.Usage.PromptTokens,
 		OutputTokens:    cr.Usage.CompletionTokens,
 		ReasoningTokens: cr.Usage.CompletionTokensDetails.ReasoningTokens,
-	}, nil
+	}
+	if r.ReasoningTokens > 0 {
+		slog.Warn("llm: unexpected thinking tokens detected — enable_thinking may not be taking effect",
+			"reasoning_tokens", r.ReasoningTokens, "model", c.model)
+	}
+	return r, nil
 }
 
 func (c *openAIClient) Chat(ctx context.Context, messages []Message) (*Response, error) {
@@ -203,9 +216,10 @@ func (c *openAIClient) ChatSchema(ctx context.Context, messages []Message, schem
 			},
 		},
 	}
-	lower := strings.ToLower(c.baseURL)
-	if strings.Contains(lower, "dashscope") || strings.Contains(lower, "deepseek") {
-		req.ExtraBody = map[string]any{"enable_thinking": c.enableThinking}
+	lower2 := strings.ToLower(c.baseURL)
+	if strings.Contains(lower2, "dashscope") || strings.Contains(lower2, "deepseek") {
+		t := c.enableThinking
+		req.EnableThinking = &t
 	}
 	body, err := json.Marshal(req)
 	if err != nil {
