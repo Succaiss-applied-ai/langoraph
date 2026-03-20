@@ -37,8 +37,13 @@ type Response struct {
 type Client interface {
 	// Chat sends messages and returns the model reply.
 	Chat(ctx context.Context, messages []Message) (*Response, error)
-	// ChatJSON is like Chat but requests JSON-mode output.
+	// ChatJSON is like Chat but requests JSON-mode output (json_object).
 	ChatJSON(ctx context.Context, messages []Message) (*Response, error)
+	// ChatSchema sends messages with a json_schema response_format, matching
+	// Python's _invoke_structured_json_with_retry with json_schema enabled.
+	// This is significantly faster than ChatJSON for DashScope/Qwen because
+	// the model outputs tokens strictly within the schema without preamble.
+	ChatSchema(ctx context.Context, messages []Message, schemaName string, schema map[string]any) (*Response, error)
 }
 
 // ---- OpenAI-compatible client ----
@@ -64,7 +69,14 @@ type chatRequest struct {
 }
 
 type responseFormat struct {
-	Type string `json:"type"`
+	Type       string             `json:"type"`
+	JSONSchema *jsonSchemaWrapper `json:"json_schema,omitempty"`
+}
+
+type jsonSchemaWrapper struct {
+	Name   string         `json:"name"`
+	Schema map[string]any `json:"schema"`
+	Strict bool           `json:"strict,omitempty"`
 }
 
 type chatResponse struct {
@@ -175,6 +187,64 @@ func (c *openAIClient) Chat(ctx context.Context, messages []Message) (*Response,
 
 func (c *openAIClient) ChatJSON(ctx context.Context, messages []Message) (*Response, error) {
 	return c.chat(ctx, messages, true)
+}
+
+func (c *openAIClient) ChatSchema(ctx context.Context, messages []Message, schemaName string, schema map[string]any) (*Response, error) {
+	req := chatRequest{
+		Model:       c.model,
+		Messages:    messages,
+		Temperature: c.temperature,
+		Stream:      false,
+		ResponseFormat: &responseFormat{
+			Type: "json_schema",
+			JSONSchema: &jsonSchemaWrapper{
+				Name:   schemaName,
+				Schema: schema,
+			},
+		},
+	}
+	lower := strings.ToLower(c.baseURL)
+	if strings.Contains(lower, "dashscope") || strings.Contains(lower, "deepseek") {
+		req.ExtraBody = map[string]any{"enable_thinking": c.enableThinking}
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("llm: marshal request: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.baseURL+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("llm: build request: %w", err)
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("llm: http request: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("llm: read body: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("llm: provider returned %d: %s", resp.StatusCode, string(raw))
+	}
+	var cr chatResponse
+	if err := json.Unmarshal(raw, &cr); err != nil {
+		return nil, fmt.Errorf("llm: unmarshal response: %w", err)
+	}
+	if len(cr.Choices) == 0 {
+		return nil, fmt.Errorf("llm: no choices in response")
+	}
+	return &Response{
+		Content:         cr.Choices[0].Message.Content,
+		ThinkingContent: cr.Choices[0].Message.ReasoningContent,
+		InputTokens:     cr.Usage.PromptTokens,
+		OutputTokens:    cr.Usage.CompletionTokens,
+		ReasoningTokens: cr.Usage.CompletionTokensDetails.ReasoningTokens,
+	}, nil
 }
 
 // ---- Factory ----
