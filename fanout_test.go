@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	langoraph "github.com/zhaocun/langoraph"
+	langoraph "github.com/Succaiss-applied-ai/langoraph"
 )
 
 // ----- TestFanout_ResultsInOrder -----

@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	langoraph "github.com/zhaocun/langoraph"
-	"github.com/zhaocun/langoraph/llm"
+	langoraph "github.com/Succaiss-applied-ai/langoraph"
+	"github.com/Succaiss-applied-ai/langoraph/llm"
 )
 
 // ---------------------------------------------------------------------------

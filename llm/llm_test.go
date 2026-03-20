@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/zhaocun/langoraph/llm"
+	"github.com/Succaiss-applied-ai/langoraph/llm"
 )
 
 // ---------------------------------------------------------------------------
