@@ -1,10 +1,11 @@
 # langoraph
 
-A Go implementation of [LangGraph](https://github.com/langchain-ai/langgraph) primitives — typed pipelines, concurrent fan-out, and a plug-and-play LLM client that works with DashScope (Qwen), DeepSeek, and OpenAI out of the box.
+A Go implementation of [LangGraph](https://github.com/langchain-ai/langgraph) primitives — typed pipelines, conditional/parallel graph execution, concurrent fan-out, and a plug-and-play LLM client that works with DashScope (Qwen), DeepSeek, and OpenAI out of the box.
 
 ## Features
 
 - **`Pipeline[S]`** — run a fixed sequence of typed nodes against shared state, with optional per-node error recording
+- **`Graph[S]`** — execute nodes connected by directed edges with support for conditional routing and parallel fan-out
 - **`RunAll`** — execute one pipeline against many independent states concurrently
 - **`Fanout`** — concurrently process a slice of items and collect results in input order
 - **`llm` package** — unified `Client` interface backed by any OpenAI-compatible provider
@@ -12,49 +13,74 @@ A Go implementation of [LangGraph](https://github.com/langchain-ai/langgraph) pr
 ## Installation
 
 ```bash
-go get github.com/zhaocun/langoraph
+go get github.com/Succaiss-applied-ai/langoraph
 ```
 
-Requires **Go 1.21+**.
+Requires **Go 1.22+**.
 
 ## Quick Start
 
-### Pipeline
+### Pipeline (linear)
 
 ```go
-package main
+var p langoraph.Pipeline[State]
 
-import (
-    "context"
-    "fmt"
+p.AddNode("step1", func(_ context.Context, s *State) error {
+    s.Input = "hello"
+    return nil
+})
+p.AddNode("step2", func(_ context.Context, s *State) error {
+    s.Result = s.Input + " world"
+    return nil
+})
 
-    langoraph "github.com/zhaocun/langoraph"
-)
-
-type State struct {
-    Input  string
-    Result string
-}
-
-func main() {
-    var p langoraph.Pipeline[State]
-
-    p.AddNode("step1", func(_ context.Context, s *State) error {
-        s.Input = "hello"
-        return nil
-    })
-    p.AddNode("step2", func(_ context.Context, s *State) error {
-        s.Result = s.Input + " world"
-        return nil
-    })
-
-    state := &State{}
-    if err := p.Run(context.Background(), state); err != nil {
-        panic(err)
-    }
-    fmt.Println(state.Result) // hello world
-}
+state := &State{}
+_ = p.Run(context.Background(), state)
+fmt.Println(state.Result) // hello world
 ```
+
+### Graph (conditional edges)
+
+```go
+g := langoraph.NewGraph[State]()
+
+g.AddNode("classify", classifyFn)
+g.AddNode("positive", positiveFn)
+g.AddNode("negative", negativeFn)
+
+g.AddEdge(langoraph.START, "classify")
+g.AddConditionalEdge("classify",
+    func(_ context.Context, s *State) string {
+        if s.Sentiment >= 0 { return "pos" }
+        return "neg"
+    },
+    map[string]string{"pos": "positive", "neg": "negative"},
+)
+g.AddEdge("positive", langoraph.END)
+g.AddEdge("negative", langoraph.END)
+
+_ = g.Run(context.Background(), &State{})
+```
+
+### Graph (parallel fan-out + join)
+
+```go
+g := langoraph.NewGraph[State]()
+
+g.AddNode("prepare", prepareFn)
+g.AddNode("branch_a", branchAFn)
+g.AddNode("branch_b", branchBFn)
+g.AddNode("branch_c", branchCFn)
+g.AddNode("aggregate", aggregateFn)
+
+g.AddEdge(langoraph.START, "prepare")
+g.AddParallelEdge("prepare", []string{"branch_a", "branch_b", "branch_c"}, "aggregate")
+g.AddEdge("aggregate", langoraph.END)
+
+_ = g.Run(context.Background(), &State{})
+```
+
+Branches run concurrently on the shared state. Callers must ensure branch functions do not race on overlapping fields.
 
 ### Fanout
 
@@ -83,14 +109,13 @@ Set one of the following environment variables, then call `llm.NewClient`:
 When `Provider` is empty, the first key found wins (DashScope → DeepSeek → OpenAI).
 
 ```go
-import "github.com/zhaocun/langoraph/llm"
+import "github.com/Succaiss-applied-ai/langoraph/llm"
 
 client, err := llm.NewClient(llm.Config{Temperature: 0.7, TimeoutSeconds: 30})
 if err != nil {
     log.Fatal(err)
 }
 
-// Structured JSON output
 var out struct {
     Answer string `json:"answer"`
 }
