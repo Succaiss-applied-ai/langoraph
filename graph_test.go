@@ -3,11 +3,29 @@ package langoraph_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"runtime"
 	"sync/atomic"
 	"testing"
 
 	langoraph "github.com/Succaiss-applied-ai/langoraph"
 )
+
+// ----- mock State types -----
+
+type RecordingState struct {
+	Value  int
+	Steps  []string
+	Errors []string
+}
+
+func (s *RecordingState) RecordError(nodeName string, err error) {
+	s.Errors = append(s.Errors, fmt.Sprintf("[%s] %v", nodeName, err))
+}
+
+type StrictState struct {
+	Value int
+}
 
 // ----- TestGraph_LinearExecution -----
 // A graph with only fixed edges behaves like a linear pipeline.
@@ -504,23 +522,14 @@ func TestGraph_ParallelEdge_BasicFanOut(t *testing.T) {
 func TestGraph_ParallelEdge_ActuallyConcurrent(t *testing.T) {
 	g := langoraph.NewGraph[StrictState]()
 
-	var active int64
-	var maxActive int64
+	const branches = 3
+	barrier := make(chan struct{})
+	var arrived int64
 
 	makeBranch := func() langoraph.NodeFunc[StrictState] {
 		return func(ctx context.Context, s *StrictState) error {
-			cur := atomic.AddInt64(&active, 1)
-			for {
-				old := atomic.LoadInt64(&maxActive)
-				if cur <= old || atomic.CompareAndSwapInt64(&maxActive, old, cur) {
-					break
-				}
-			}
-			// yield to scheduler to give other goroutines a chance
-			done := make(chan struct{})
-			go func() { close(done) }()
-			<-done
-			atomic.AddInt64(&active, -1)
+			atomic.AddInt64(&arrived, 1)
+			<-barrier
 			return nil
 		}
 	}
@@ -531,6 +540,13 @@ func TestGraph_ParallelEdge_ActuallyConcurrent(t *testing.T) {
 	g.AddNode("b3", makeBranch())
 	g.AddNode("done", func(_ context.Context, s *StrictState) error { return nil })
 
+	go func() {
+		for atomic.LoadInt64(&arrived) < branches {
+			runtime.Gosched()
+		}
+		close(barrier)
+	}()
+
 	g.AddEdge(langoraph.START, "entry")
 	g.AddParallelEdge("entry", []string{"b1", "b2", "b3"}, "done")
 	g.AddEdge("done", langoraph.END)
@@ -539,8 +555,8 @@ func TestGraph_ParallelEdge_ActuallyConcurrent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if maxActive < 2 {
-		t.Errorf("expected concurrent execution (maxActive>=2), got %d", maxActive)
+	if arrived != branches {
+		t.Errorf("expected all %d branches to arrive at barrier, got %d", branches, arrived)
 	}
 }
 

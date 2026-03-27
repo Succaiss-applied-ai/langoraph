@@ -15,6 +15,17 @@ const (
 	defaultMaxSteps = 1000
 )
 
+// NodeFunc is the function signature for a graph node.
+// It receives a pointer to the shared State and mutates it in place.
+type NodeFunc[S any] func(ctx context.Context, state *S) error
+
+// ErrorRecorder is an optional interface that State types can implement
+// to allow the graph to record per-node errors without interrupting execution.
+// If State does not implement this interface, a node error will stop the graph.
+type ErrorRecorder interface {
+	RecordError(nodeName string, err error)
+}
+
 // RouterFunc examines state and returns a routing key that determines the
 // next node to execute. The returned string is looked up in the mapping
 // supplied to AddConditionalEdge; if not found, it is used directly as a
@@ -261,4 +272,17 @@ func (g *Graph[S]) validate() error {
 	}
 
 	return nil
+}
+
+// RunAll concurrently runs the graph against each state in states.
+// Each state is independent; mutations do not affect other states.
+func RunAll[S any](ctx context.Context, g *Graph[S], states []*S) error {
+	eg, ctx := errgroup.WithContext(ctx)
+	for _, s := range states {
+		s := s
+		eg.Go(func() error {
+			return g.Run(ctx, s)
+		})
+	}
+	return eg.Wait()
 }

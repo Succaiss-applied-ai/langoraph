@@ -1,4 +1,4 @@
-// Integration tests for Pipeline and Fanout with real LLM nodes.
+// Integration tests for Graph and Fanout with real LLM nodes.
 // Run with: go test ./... -run Integration -v
 // (auto-skipped if no API key is available)
 package langoraph_test
@@ -61,35 +61,32 @@ func newIntegrationClient(t *testing.T) llm.Client {
 }
 
 // ---------------------------------------------------------------------------
-// TestPipeline_Integration_LLMNode
-// A 3-node pipeline where node2 calls the real LLM to transform state.
-// Verifies that the pipeline correctly wires node outputs into subsequent nodes.
+// TestGraph_Integration_LLMNode
+// A 3-node graph where node2 calls the real LLM to transform state.
 // ---------------------------------------------------------------------------
 
-type LLMPipelineState struct {
-	Input    string
-	Summary  string // written by LLM node
-	WordCount int   // written by next node
-	Errors   []string
+type LLMGraphState struct {
+	Input     string
+	Summary   string
+	WordCount int
+	Errors    []string
 }
 
-func (s *LLMPipelineState) RecordError(node string, err error) {
+func (s *LLMGraphState) RecordError(node string, err error) {
 	s.Errors = append(s.Errors, fmt.Sprintf("[%s] %v", node, err))
 }
 
-func TestPipeline_Integration_LLMNode(t *testing.T) {
+func TestGraph_Integration_LLMNode(t *testing.T) {
 	client := newIntegrationClient(t)
 
-	var p langoraph.Pipeline[LLMPipelineState]
+	g := langoraph.NewGraph[LLMGraphState]()
 
-	// Node 1: set the input text
-	p.AddNode("set_input", func(_ context.Context, s *LLMPipelineState) error {
+	g.AddNode("set_input", func(_ context.Context, s *LLMGraphState) error {
 		s.Input = "Go 语言由 Google 开发，以简洁、高效著称，内置并发支持（goroutine），编译速度快，生态丰富。"
 		return nil
 	})
 
-	// Node 2: call the LLM to summarise
-	p.AddNode("llm_summarise", func(ctx context.Context, s *LLMPipelineState) error {
+	g.AddNode("llm_summarise", func(ctx context.Context, s *LLMGraphState) error {
 		prompt := fmt.Sprintf(
 			`请用不超过10个字总结以下内容，只输出 JSON：{"summary":"..."}\n内容：%s`,
 			s.Input,
@@ -104,18 +101,22 @@ func TestPipeline_Integration_LLMNode(t *testing.T) {
 		return nil
 	})
 
-	// Node 3: count words in the summary (pure logic)
-	p.AddNode("count_words", func(_ context.Context, s *LLMPipelineState) error {
+	g.AddNode("count_words", func(_ context.Context, s *LLMGraphState) error {
 		s.WordCount = len([]rune(s.Summary))
 		return nil
 	})
 
-	state := &LLMPipelineState{}
+	g.AddEdge(langoraph.START, "set_input")
+	g.AddEdge("set_input", "llm_summarise")
+	g.AddEdge("llm_summarise", "count_words")
+	g.AddEdge("count_words", langoraph.END)
+
+	state := &LLMGraphState{}
 	start := time.Now()
-	if err := p.Run(context.Background(), state); err != nil {
-		t.Fatalf("pipeline failed: %v", err)
+	if err := g.Run(context.Background(), state); err != nil {
+		t.Fatalf("graph failed: %v", err)
 	}
-	t.Logf("pipeline completed in %v", time.Since(start))
+	t.Logf("graph completed in %v", time.Since(start))
 
 	if len(state.Errors) > 0 {
 		t.Errorf("node errors: %v", state.Errors)
@@ -131,19 +132,16 @@ func TestPipeline_Integration_LLMNode(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // TestRunAll_Integration_Parallel
-// Runs 3 independent pipelines concurrently, each with an LLM call.
-// Verifies that RunAll completes all of them and they run in parallel.
+// Runs 3 independent graphs concurrently, each with an LLM call.
 // ---------------------------------------------------------------------------
 
 func TestRunAll_Integration_Parallel(t *testing.T) {
 	client := newIntegrationClient(t)
 
 	type QState struct {
-		Role    string
-		Answer  string
-		Errors  []string
+		Role   string
+		Answer string
 	}
-	// QState doesn't implement ErrorRecorder on purpose — errors are fatal.
 
 	roles := []string{"前端工程师", "后端工程师", "数据工程师"}
 	states := make([]*QState, len(roles))
@@ -151,10 +149,10 @@ func TestRunAll_Integration_Parallel(t *testing.T) {
 		states[i] = &QState{Role: r}
 	}
 
-	var p langoraph.Pipeline[QState]
 	var callCount int64
 
-	p.AddNode("ask_llm", func(ctx context.Context, s *QState) error {
+	g := langoraph.NewGraph[QState]()
+	g.AddNode("ask_llm", func(ctx context.Context, s *QState) error {
 		atomic.AddInt64(&callCount, 1)
 		prompt := fmt.Sprintf(
 			`请用一句话描述 %s 的核心职责，只输出 JSON：{"answer":"..."}`,
@@ -169,9 +167,11 @@ func TestRunAll_Integration_Parallel(t *testing.T) {
 		s.Answer = out.Answer
 		return nil
 	})
+	g.AddEdge(langoraph.START, "ask_llm")
+	g.AddEdge("ask_llm", langoraph.END)
 
 	start := time.Now()
-	if err := langoraph.RunAll(context.Background(), &p, states); err != nil {
+	if err := langoraph.RunAll(context.Background(), g, states); err != nil {
 		t.Fatalf("RunAll failed: %v", err)
 	}
 	elapsed := time.Since(start)
@@ -233,7 +233,6 @@ func TestFanout_Integration_LLM(t *testing.T) {
 		t.Fatalf("expected %d results, got %d", len(questions), len(results))
 	}
 	for i, r := range results {
-		// Order must match input order
 		if r.Q != questions[i] {
 			t.Errorf("result[%d]: question mismatch, want %q got %q", i, questions[i], r.Q)
 		}
