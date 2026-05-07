@@ -2,8 +2,7 @@ package langoraph
 
 import (
 	"context"
-
-	"golang.org/x/sync/errgroup"
+	"sync"
 )
 
 // ItemFunc is the function signature for a single fan-out task.
@@ -17,25 +16,48 @@ type ItemFunc[Item, Output any] func(ctx context.Context, item Item) (Output, er
 //   - LangGraph Send() fan-out from parse_input
 //   - operator.add reducer that accumulates item_results
 //
-// If any item returns an error, Fanout waits for all in-flight items to finish
-// and returns the first error. Successfully completed results up to that point
-// are still written to the output slice.
+// Parallel semantics — DELIBERATELY MATCHES LangGraph
+// ---------------------------------------------------
+// Every goroutine runs to its natural completion regardless of sibling
+// failures. The shared ``ctx`` is **never** cancelled by Fanout itself
+// (callers can still cancel it externally). After all goroutines have
+// returned, Fanout returns the first non-nil error encountered, in the
+// order items appear in the input slice — making the returned error
+// deterministic across runs.
+//
+// This mirrors Python's ``asyncio.gather(*coros, return_exceptions=False)``
+// behaviour at the time the awaiter raises: the gather call propagates
+// the first exception, but **does not** cancel sibling tasks. We extend
+// that contract slightly by waiting for siblings to finish before
+// returning, so the caller never observes leaked in-flight goroutines.
+//
+// Successfully completed results are written to the output slice
+// regardless of whether any sibling errored, so callers may inspect
+// the partial output alongside the returned error.
 func Fanout[Item, Output any](ctx context.Context, items []Item, fn ItemFunc[Item, Output]) ([]Output, error) {
 	results := make([]Output, len(items))
-	g, ctx := errgroup.WithContext(ctx)
+	errs := make([]error, len(items))
+
+	var wg sync.WaitGroup
 	for i, item := range items {
 		i, item := i, item
-		g.Go(func() error {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
 			out, err := fn(ctx, item)
 			if err != nil {
-				return err
+				errs[i] = err
+				return
 			}
 			results[i] = out
-			return nil
-		})
+		}()
 	}
-	if err := g.Wait(); err != nil {
-		return nil, err
+	wg.Wait()
+
+	for _, err := range errs {
+		if err != nil {
+			return results, err
+		}
 	}
 	return results, nil
 }
