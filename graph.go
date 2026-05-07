@@ -4,9 +4,34 @@ import (
 	"context"
 	"fmt"
 	"sync"
-
-	"golang.org/x/sync/errgroup"
 )
+
+// Parallel semantics — DELIBERATELY MATCHES LangGraph
+// ---------------------------------------------------
+// When ``AddParallelEdge(from, branches, then)`` fires, every branch
+// goroutine runs to its natural completion regardless of sibling
+// failures. The shared ``ctx`` is **never** cancelled by Graph itself
+// (callers can still cancel it externally). After all branches have
+// returned, behaviour splits on whether ``State`` implements
+// ``ErrorRecorder``:
+//
+//   * Recorder mode: every branch error is funnelled through
+//     ``RecordError(name, err)`` (calls are serialised by an internal
+//     mutex so user-supplied recorders need not be thread-safe), and
+//     execution continues at ``then``.
+//   * Strict mode: the first non-nil branch error in the original
+//     ``branches`` slice order is returned and execution halts before
+//     ``then`` runs.
+//
+// This mirrors LangGraph's Pregel runtime, which uses
+// ``asyncio.gather(*coros, return_exceptions=True)``-style scheduling
+// on its parallel super-step: every parallel task always runs to
+// completion, the runtime then aggregates errors deterministically.
+// Branches share ``*S`` directly, so callers must still ensure
+// concurrent branch functions do not race on overlapping fields — the
+// safe pattern is for each branch to mutate disjoint state fields, or
+// to write into per-key buckets that an aggregator node merges later
+// (see the README for the canonical "per-L0 fan-out" pattern).
 
 const (
 	START = "__start__"
@@ -163,37 +188,61 @@ func (g *Graph[S]) Run(ctx context.Context, state *S) error {
 	return nil
 }
 
-// runParallel executes all branch nodes concurrently.
-// With ErrorRecorder: all branches run to completion, errors are recorded.
-// Without ErrorRecorder: first error cancels remaining branches.
+// runParallel executes every branch node concurrently and waits for
+// all of them to complete before returning, deliberately matching
+// LangGraph's Pregel super-step semantics (see the package-level
+// "Parallel semantics" doc-block above).
+//
+//   - With ErrorRecorder: all branches run; errors are funnelled
+//     through ``RecordError`` under an internal mutex so user
+//     recorders can stay racy-but-simple (e.g. a slice append).
+//     ``runParallel`` always returns nil so execution flows to ``then``.
+//   - Without ErrorRecorder: all branches still run to completion;
+//     ``runParallel`` then returns the first non-nil error in the
+//     original ``branches`` slice order, making the returned error
+//     deterministic across runs.
+//
+// The shared ``ctx`` is never cancelled by ``runParallel`` itself —
+// sibling branches keep running even after a peer errors. This matches
+// LangGraph and avoids leaking in-flight LLM calls when a single sub-
+// task fails fast.
 func (g *Graph[S]) runParallel(ctx context.Context, state *S, pe parallelEdge, recorder ErrorRecorder, canRecord bool) error {
+	branchErrs := make([]error, len(pe.branches))
+
+	var wg sync.WaitGroup
+	var recordMu sync.Mutex // serialises recorder.RecordError calls
+
+	for i, b := range pe.branches {
+		i, name := i, b
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := g.nodes[name](ctx, state)
+			if err == nil {
+				return
+			}
+			if canRecord {
+				recordMu.Lock()
+				recorder.RecordError(name, err)
+				recordMu.Unlock()
+				return
+			}
+			branchErrs[i] = fmt.Errorf("node %q: %w", name, err)
+		}()
+	}
+	wg.Wait()
+
 	if canRecord {
-		var wg sync.WaitGroup
-		for _, b := range pe.branches {
-			wg.Add(1)
-			go func(name string) {
-				defer wg.Done()
-				if err := g.nodes[name](ctx, state); err != nil {
-					recorder.RecordError(name, err)
-				}
-			}(b)
-		}
-		wg.Wait()
 		return nil
 	}
-
-	eg, branchCtx := errgroup.WithContext(ctx)
-	for _, b := range pe.branches {
-		name := b
-		eg.Go(func() error {
-			if err := g.nodes[name](branchCtx, state); err != nil {
-				return fmt.Errorf("node %q: %w", name, err)
-			}
-			return nil
-		})
+	for _, err := range branchErrs {
+		if err != nil {
+			return err
+		}
 	}
-	return eg.Wait()
+	return nil
 }
+
 
 // resolveNext returns the next node name after from. It checks fixed edges
 // first, then conditional edges. Returns "" if no edge is found.
@@ -276,13 +325,37 @@ func (g *Graph[S]) validate() error {
 
 // RunAll concurrently runs the graph against each state in states.
 // Each state is independent; mutations do not affect other states.
+//
+// Parallel semantics — DELIBERATELY MATCHES LangGraph
+// ---------------------------------------------------
+// Every state's graph runs to its natural completion regardless of
+// sibling failures. The shared ``ctx`` is **never** cancelled by
+// RunAll itself; an external cancellation of ``ctx`` still aborts every
+// in-flight graph. After all graphs return, RunAll returns the first
+// non-nil error in the order states appear in the input slice.
+//
+// This matches the "wait-all, deterministic-first-error" contract used
+// by ``Fanout`` and ``Graph.runParallel``, so callers get the same
+// behaviour whether they fan out items, parallel-edge branches, or
+// whole graphs.
 func RunAll[S any](ctx context.Context, g *Graph[S], states []*S) error {
-	eg, ctx := errgroup.WithContext(ctx)
-	for _, s := range states {
-		s := s
-		eg.Go(func() error {
-			return g.Run(ctx, s)
-		})
+	errs := make([]error, len(states))
+
+	var wg sync.WaitGroup
+	for i, s := range states {
+		i, s := i, s
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = g.Run(ctx, s)
+		}()
 	}
-	return eg.Wait()
+	wg.Wait()
+
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }

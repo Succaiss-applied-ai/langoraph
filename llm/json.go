@@ -17,24 +17,29 @@ import (
 //
 // Call ChatStructuredWithSchema when you have a schema (most nodes).
 // Call ChatStructured for backward compat / nodes without schema.
-func ChatStructured(ctx context.Context, client Client, prompt string, dst any) error {
-	return chatStructuredInner(ctx, client, prompt, "", nil, dst)
+//
+// Per-call ChatOptions (streaming, sampling overrides, …) flow through
+// to every underlying ChatJSON / ChatSchema invocation, so a caller
+// can stream a structured-output retry loop without losing the schema
+// or fence-stripping logic.
+func ChatStructured(ctx context.Context, client Client, prompt string, dst any, opts ...ChatOption) error {
+	return chatStructuredInner(ctx, client, prompt, "", nil, dst, opts)
 }
 
 // ChatStructuredWithSchema is like ChatStructured but uses json_schema response_format
 // (Structured Outputs) first, falling back to plain JSON mode on error.
 // This matches Python when AGENTIC_RAG_ENABLE_JSON_SCHEMA=true, and is significantly
 // faster for DashScope/Qwen because the model outputs tokens strictly within the schema.
-func ChatStructuredWithSchema(ctx context.Context, client Client, prompt, schemaName string, schema map[string]any, dst any) error {
-	return chatStructuredInner(ctx, client, prompt, schemaName, schema, dst)
+func ChatStructuredWithSchema(ctx context.Context, client Client, prompt, schemaName string, schema map[string]any, dst any, opts ...ChatOption) error {
+	return chatStructuredInner(ctx, client, prompt, schemaName, schema, dst, opts)
 }
 
-func chatStructuredInner(ctx context.Context, client Client, prompt, schemaName string, schema map[string]any, dst any) error {
+func chatStructuredInner(ctx context.Context, client Client, prompt, schemaName string, schema map[string]any, dst any, opts []ChatOption) error {
 	msgs := []Message{{Role: "user", Content: prompt}}
 
 	// Try json_schema mode first when schema is provided (mirrors Python schema_enabled path).
 	if schemaName != "" && schema != nil {
-		resp, err := client.ChatSchema(ctx, msgs, schemaName, schema)
+		resp, err := client.ChatSchema(ctx, msgs, schemaName, schema, opts...)
 		if err == nil {
 			raw, jerr := extractJSON(resp.Content)
 			if jerr == nil {
@@ -52,7 +57,7 @@ func chatStructuredInner(ctx context.Context, client Client, prompt, schemaName 
 	// Plain JSON mode with retries (mirrors Python plain / plain_retry path).
 	var lastErr error
 	for attempt := 0; attempt <= 2; attempt++ {
-		resp, err := client.ChatJSON(ctx, msgs)
+		resp, err := client.ChatJSON(ctx, msgs, opts...)
 		if err != nil {
 			return fmt.Errorf("llm: chat failed: %w", err)
 		}
