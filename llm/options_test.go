@@ -24,6 +24,7 @@ func captureServer(t *testing.T) (*httptest.Server, *requestRecorder) {
 		body, _ := io.ReadAll(r.Body)
 		rec.add(body)
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Request-Id", "provider-request-123")
 		_, _ = w.Write([]byte(`{
 			"choices":[{"message":{"content":"ok"}}],
 			"usage":{"prompt_tokens":1,"completion_tokens":2}
@@ -31,6 +32,19 @@ func captureServer(t *testing.T) (*httptest.Server, *requestRecorder) {
 	}))
 	t.Cleanup(srv.Close)
 	return srv, rec
+}
+
+func TestChatNonStreamCapturesProviderRequestID(t *testing.T) {
+	srv, _ := captureServer(t)
+	c := stubClient(t, srv.URL, Config{})
+
+	resp, err := c.Chat(context.Background(), []Message{{Role: "user", Content: "hi"}})
+	if err != nil {
+		t.Fatalf("Chat failed: %v", err)
+	}
+	if resp.ProviderRequestID != "provider-request-123" {
+		t.Fatalf("ProviderRequestID = %q", resp.ProviderRequestID)
+	}
 }
 
 type requestRecorder struct {

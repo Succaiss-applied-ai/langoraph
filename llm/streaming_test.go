@@ -85,6 +85,7 @@ func streamServer(t *testing.T, handler http.HandlerFunc) *httptest.Server {
 
 func TestStreaming_HappyPath(t *testing.T) {
 	srv := streamServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-DashScope-Request-Id", "stream-request-123")
 		s := newSSEWriter(w)
 		s.write(contentDelta("Hello"))
 		s.write(contentDelta(", "))
@@ -108,6 +109,9 @@ func TestStreaming_HappyPath(t *testing.T) {
 	}
 	if resp.InputTokens != 11 || resp.OutputTokens != 22 {
 		t.Errorf("usage: expected (11,22), got (%d,%d)", resp.InputTokens, resp.OutputTokens)
+	}
+	if resp.ProviderRequestID != "stream-request-123" {
+		t.Errorf("ProviderRequestID: expected stream-request-123, got %q", resp.ProviderRequestID)
 	}
 }
 

@@ -17,11 +17,11 @@ import (
 
 // FirstTokenTimeoutError is returned by the streaming chat path when
 // the watchdog fires before any content (or reasoning_content) delta
-// arrives. It is a TimeoutError so callers can use ``errors.Is(err,
-// context.DeadlineExceeded)``-style probing without a special branch.
+// arrives. It is a TimeoutError so callers can use “errors.Is(err,
+// context.DeadlineExceeded)“-style probing without a special branch.
 //
-// Mirrors Python's ``LLMFirstTokenTimeout`` from
-// ``app/llm/dashscope_client.py``.
+// Mirrors Python's “LLMFirstTokenTimeout“ from
+// “app/llm/dashscope_client.py“.
 type FirstTokenTimeoutError struct {
 	Budget time.Duration
 	Model  string
@@ -166,8 +166,9 @@ func (c *openAIClient) streamOnce(
 	}
 
 	r := &Response{
-		Content:         strings.Join(parts, ""),
-		ThinkingContent: strings.Join(reasoningParts, ""),
+		Content:           strings.Join(parts, ""),
+		ThinkingContent:   strings.Join(reasoningParts, ""),
+		ProviderRequestID: providerRequestID(resp.Header),
 	}
 	if usage != nil {
 		r.InputTokens = usage.PromptTokens
@@ -184,7 +185,7 @@ func (c *openAIClient) streamOnce(
 var errBodyClosed = errors.New("llm: response body closed by watchdog")
 
 // firstTokenWatchdog aborts the SSE response body if the first content
-// (or reasoning_content) delta does not arrive within ``timeout``.
+// (or reasoning_content) delta does not arrive within “timeout“.
 // Exactly one of {timer fires, first-token-arrived} wins via an atomic
 // CAS, so callers cannot observe a half-armed state.
 type firstTokenWatchdog struct {
@@ -196,10 +197,10 @@ type firstTokenWatchdog struct {
 	once     sync.Once
 }
 
-// newFirstTokenWatchdog returns a watchdog that will Close ``body``
-// after ``timeout`` unless ``signalFirstToken`` is called first.
+// newFirstTokenWatchdog returns a watchdog that will Close “body“
+// after “timeout“ unless “signalFirstToken“ is called first.
 // A non-positive timeout disables the watchdog entirely (all signal
-// calls become no-ops, ``timedOut`` is always false).
+// calls become no-ops, “timedOut“ is always false).
 func newFirstTokenWatchdog(body io.Closer, timeout time.Duration) *firstTokenWatchdog {
 	wd := &firstTokenWatchdog{body: body}
 	if timeout <= 0 {
@@ -271,13 +272,13 @@ func isFirstTokenTimeoutErr(ctx context.Context, err error, timeout time.Duratio
 // parseSSEStream consumes the OpenAI / DashScope event-stream wire
 // format and returns:
 //
-//   - parts: every ``delta.content`` chunk, in arrival order, ready to
+//   - parts: every “delta.content“ chunk, in arrival order, ready to
 //     join into the final response Content.
-//   - reasoningParts: every ``delta.reasoning_content`` chunk for the
+//   - reasoningParts: every “delta.reasoning_content“ chunk for the
 //     thinking-model trace (kept separate so callers don't accidentally
 //     concatenate them into the user-facing Content).
 //   - usage: the populated usage block from the final usage-only chunk
-//     (DashScope sends one when ``stream_options.include_usage=true``);
+//     (DashScope sends one when “stream_options.include_usage=true“);
 //     nil when the provider does not emit it.
 //
 // The watchdog is disarmed the first time **either** a content delta
