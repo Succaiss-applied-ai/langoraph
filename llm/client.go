@@ -9,15 +9,15 @@
 // Each Client supports both modes. The active mode for a single call
 // is resolved from (highest precedence first):
 //
-//  1. ``WithStream(true|false)`` option passed at the call site.
-//  2. ``Config.Stream`` set when the Client was built with NewClient.
-//  3. Default of ``false`` (a single non-streaming round-trip).
+//  1. “WithStream(true|false)“ option passed at the call site.
+//  2. “Config.Stream“ set when the Client was built with NewClient.
+//  3. Default of “false“ (a single non-streaming round-trip).
 //
 // For DashScope/DeepSeek "thinking" models, streaming mode is the only
 // safe choice — non-streaming requests sit on the connection until the
 // model finishes thinking, often exceeding the HTTP timeout. Streaming
 // mode runs a first-token watchdog that recognises the
-// ``reasoning_content`` heartbeat as proof-of-life so reasoning bursts
+// “reasoning_content“ heartbeat as proof-of-life so reasoning bursts
 // do not falsely time out.
 package llm
 
@@ -42,11 +42,12 @@ type Message struct {
 
 // Response is the parsed LLM reply.
 type Response struct {
-	Content         string
-	ThinkingContent string // reasoning_content from Qwen thinking mode
-	InputTokens     int
-	OutputTokens    int
-	ReasoningTokens int
+	Content           string
+	ThinkingContent   string // reasoning_content from Qwen thinking mode
+	InputTokens       int
+	OutputTokens      int
+	ReasoningTokens   int
+	ProviderRequestID string // provider HTTP response request id
 }
 
 // Client is the interface every LLM provider must satisfy.
@@ -140,6 +141,20 @@ type chatResponse struct {
 			ReasoningTokens int `json:"reasoning_tokens"`
 		} `json:"completion_tokens_details"`
 	} `json:"usage"`
+}
+
+func providerRequestID(headers http.Header) string {
+	for _, name := range []string{
+		"x-request-id",
+		"x-dashscope-request-id",
+		"x-acs-request-id",
+		"request-id",
+	} {
+		if value := strings.TrimSpace(headers.Get(name)); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // sharedTransport is a package-level HTTP transport shared across all LLM clients.
@@ -315,11 +330,12 @@ func (c *openAIClient) chatNonStream(ctx context.Context, req chatRequest) (*Res
 	}
 
 	r := &Response{
-		Content:         cr.Choices[0].Message.Content,
-		ThinkingContent: cr.Choices[0].Message.ReasoningContent,
-		InputTokens:     cr.Usage.PromptTokens,
-		OutputTokens:    cr.Usage.CompletionTokens,
-		ReasoningTokens: cr.Usage.CompletionTokensDetails.ReasoningTokens,
+		Content:           cr.Choices[0].Message.Content,
+		ThinkingContent:   cr.Choices[0].Message.ReasoningContent,
+		InputTokens:       cr.Usage.PromptTokens,
+		OutputTokens:      cr.Usage.CompletionTokens,
+		ReasoningTokens:   cr.Usage.CompletionTokensDetails.ReasoningTokens,
+		ProviderRequestID: providerRequestID(resp.Header),
 	}
 	if r.ReasoningTokens > 0 && !req.streamingThinkingEnabled() {
 		slog.Warn("llm: unexpected thinking tokens detected — enable_thinking may not be taking effect",
@@ -394,8 +410,8 @@ var providers = []providerConfig{
 
 // Config holds LLM client configuration.
 type Config struct {
-	Provider       string  // "dashscope" | "deepseek" | "openai" | "" (auto)
-	Model          string  // override model name
+	Provider       string // "dashscope" | "deepseek" | "openai" | "" (auto)
+	Model          string // override model name
 	Temperature    float64
 	TimeoutSeconds int
 	EnableThinking bool
