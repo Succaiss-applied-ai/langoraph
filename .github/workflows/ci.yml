@@ -256,7 +256,7 @@ jobs:
         run: go test -count=1 -covermode=atomic -coverprofile=coverage-${{ matrix.go }}.out ./...
 
       - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-${{ matrix.go }}
           path: coverage-${{ matrix.go }}.out
