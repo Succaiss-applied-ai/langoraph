@@ -1,5 +1,8 @@
 # langoraph
 
+[![CI](https://github.com/Succaiss-applied-ai/langoraph/actions/workflows/ci.yml/badge.svg)](https://github.com/Succaiss-applied-ai/langoraph/actions/workflows/ci.yml)
+[![Security](https://github.com/Succaiss-applied-ai/langoraph/actions/workflows/security.yml/badge.svg)](https://github.com/Succaiss-applied-ai/langoraph/actions/workflows/security.yml)
+
 A Go implementation of [LangGraph](https://github.com/langchain-ai/langgraph) primitives — typed graphs with conditional/parallel execution, concurrent fan-out, and a streaming-capable LLM client that works with DashScope (Qwen), DeepSeek, and OpenAI out of the box.
 
 The parallel-execution semantics are deliberately matched to LangGraph's runtime so you can port a Python `StateGraph` to Go without surprises.
@@ -17,7 +20,7 @@ The parallel-execution semantics are deliberately matched to LangGraph's runtime
 go get github.com/Succaiss-applied-ai/langoraph
 ```
 
-Requires **Go 1.22+**.
+Requires the Go version declared in [`go.mod`](go.mod).
 
 ## Quick Start
 
@@ -240,6 +243,12 @@ Unit tests (no API key required):
 
 ```bash
 go test ./... -short -race
+```
+
+Full local gate:
+
+```bash
+make ci
 ```
 
 Integration tests (requires an API key in `.env` or env vars):

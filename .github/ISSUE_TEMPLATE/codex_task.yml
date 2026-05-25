@@ -1,0 +1,30 @@
+name: Codex task
+description: Prepare a scoped task that Codex can review or implement.
+title: "codex: "
+labels: ["codex"]
+body:
+  - type: textarea
+    id: task
+    attributes:
+      label: Task
+      description: State the concrete outcome Codex should work toward.
+    validations:
+      required: true
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Constraints
+      description: Note compatibility, API, testing, or security constraints.
+    validations:
+      required: false
+  - type: textarea
+    id: checks
+    attributes:
+      label: Expected checks
+      value: |
+        - gofmt
+        - go vet ./...
+        - go test ./...
+        - go test -race ./...
+    validations:
+      required: false

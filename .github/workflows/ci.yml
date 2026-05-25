@@ -1,0 +1,317 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      full_suite:
+        description: "Run every lane even when the diff is small"
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: ci-v3-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+permissions:
+  contents: read
+
+env:
+  GOFLAGS: -trimpath
+
+jobs:
+  preflight:
+    name: Preflight
+    if: ${{ github.event.pull_request.draft != true }}
+    runs-on: ubuntu-24.04
+    outputs:
+      docs_only: ${{ steps.scope.outputs.docs_only }}
+      run_docs: ${{ steps.scope.outputs.run_docs }}
+      run_go: ${{ steps.scope.outputs.run_go }}
+      run_workflow: ${{ steps.scope.outputs.run_workflow }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Classify changed files
+        id: scope
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          FULL_SUITE: ${{ github.event.inputs.full_suite || 'false' }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ "$FULL_SUITE" = "true" ]; then
+            {
+              echo "docs_only=false"
+              echo "run_docs=true"
+              echo "run_go=true"
+              echo "run_workflow=true"
+            } >> "$GITHUB_OUTPUT"
+            {
+              echo "## Preflight"
+              echo
+              echo "Manual full-suite dispatch: every lane is enabled."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          base="$BEFORE_SHA"
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ] && [ -n "${PR_BASE_SHA:-}" ]; then
+            base="$PR_BASE_SHA"
+          fi
+          if [ -z "${base:-}" ] || [ "$base" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            base="$(git rev-list --max-parents=0 HEAD)"
+          fi
+
+          if ! git diff --name-only "$base"...HEAD > changed-files.txt; then
+            git diff --name-only "$base" HEAD > changed-files.txt
+          fi
+          if [ ! -s changed-files.txt ]; then
+            git ls-files > changed-files.txt
+          fi
+
+          docs_changed=false
+          go_changed=false
+          workflow_changed=false
+          repo_config_changed=false
+          other_changed=false
+
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            case "$file" in
+              *.go|go.mod|go.sum)
+                go_changed=true
+                ;;
+              .github/workflows/*|.github/actions/*)
+                workflow_changed=true
+                ;;
+              README.md|CONTRIBUTING.md|SECURITY.md|AGENTS.md|LICENSE|docs/*|docs/**/*|*.md|.github/ISSUE_TEMPLATE/*|.github/PULL_REQUEST_TEMPLATE.md)
+                docs_changed=true
+                ;;
+              .github/dependabot.yml|.github/labeler.yml|.github/CODEOWNERS)
+                repo_config_changed=true
+                ;;
+              *)
+                other_changed=true
+                ;;
+            esac
+          done < changed-files.txt
+
+          docs_only=false
+          if [ "$docs_changed" = true ] && [ "$go_changed" = false ] && [ "$workflow_changed" = false ] && [ "$repo_config_changed" = false ] && [ "$other_changed" = false ]; then
+            docs_only=true
+          fi
+
+          run_go=true
+          if [ "$docs_only" = true ] || { [ "$go_changed" = false ] && [ "$other_changed" = false ]; }; then
+            run_go=false
+          fi
+
+          run_docs=false
+          if [ "$docs_changed" = true ] || [ "$workflow_changed" = true ]; then
+            run_docs=true
+          fi
+
+          run_workflow=false
+          if [ "$workflow_changed" = true ] || [ "$repo_config_changed" = true ]; then
+            run_workflow=true
+          fi
+
+          {
+            echo "docs_only=$docs_only"
+            echo "run_docs=$run_docs"
+            echo "run_go=$run_go"
+            echo "run_workflow=$run_workflow"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Preflight"
+            echo
+            echo "| Flag | Value |"
+            echo "| --- | --- |"
+            echo "| docs_changed | $docs_changed |"
+            echo "| go_changed | $go_changed |"
+            echo "| workflow_changed | $workflow_changed |"
+            echo "| repo_config_changed | $repo_config_changed |"
+            echo "| other_changed | $other_changed |"
+            echo "| docs_only | $docs_only |"
+            echo
+            echo "### Changed files"
+            sed 's/^/- /' changed-files.txt
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  workflow-sanity:
+    name: Workflow Sanity
+    needs: preflight
+    if: ${{ needs.preflight.outputs.run_workflow == 'true' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Parse workflow YAML
+        run: |
+          set -euo pipefail
+          ruby -e 'require "yaml"; Dir[".github/workflows/*.{yml,yaml}"].sort.each { |path| YAML.load_file(path); puts "ok #{path}" }'
+
+  format:
+    name: Format and Module Hygiene
+    needs: preflight
+    if: ${{ needs.preflight.outputs.run_go == 'true' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check gofmt
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          FULL_SUITE: ${{ github.event.inputs.full_suite || 'false' }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ "$FULL_SUITE" = "true" ]; then
+            changed_go="$(git ls-files '*.go')"
+          else
+            base="$BEFORE_SHA"
+            if [ "$GITHUB_EVENT_NAME" = "pull_request" ] && [ -n "${PR_BASE_SHA:-}" ]; then
+              base="$PR_BASE_SHA"
+            fi
+            if [ -z "${base:-}" ] || [ "$base" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+              base="$(git rev-list --max-parents=0 HEAD)"
+            fi
+            changed_go="$(git diff --name-only --diff-filter=ACMR "$base"...HEAD -- '*.go' || git diff --name-only --diff-filter=ACMR "$base" HEAD -- '*.go')"
+          fi
+          if [ -z "$changed_go" ]; then
+            echo "No Go files changed."
+            exit 0
+          fi
+          files="$(gofmt -l $changed_go)"
+          if [ -n "$files" ]; then
+            echo "$files"
+            exit 1
+          fi
+
+      - name: Check go.mod and go.sum
+        run: |
+          set -euo pipefail
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+  vet:
+    name: Vet
+    needs: preflight
+    if: ${{ needs.preflight.outputs.run_go == 'true' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run go vet
+        run: go vet ./...
+
+  tests:
+    name: Tests Go ${{ matrix.go }}
+    needs: preflight
+    if: ${{ needs.preflight.outputs.run_go == 'true' }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.25.x", "1.26.x"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+
+      - name: Run unit tests with coverage
+        run: go test -count=1 -covermode=atomic -coverprofile=coverage-${{ matrix.go }}.out ./...
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.go }}
+          path: coverage-${{ matrix.go }}.out
+          if-no-files-found: error
+
+  race:
+    name: Race Detector
+    needs: preflight
+    if: ${{ needs.preflight.outputs.run_go == 'true' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run race tests
+        run: go test -race -count=1 ./...
+
+  docs:
+    name: Docs Link Check
+    needs: preflight
+    if: ${{ needs.preflight.outputs.run_docs == 'true' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Check Markdown links
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: >-
+            --verbose
+            --no-progress
+            --exclude 'https://github.com/Succaiss-applied-ai/langoraph/actions/workflows/.*'
+            --exclude 'https://github.com/Succaiss-applied-ai/langoraph/security/advisories/new'
+            './**/*.md'
+          fail: true
+
+  ci-result:
+    name: CI Result
+    if: ${{ always() && github.event.pull_request.draft != true }}
+    needs: [preflight, workflow-sanity, format, vet, tests, race, docs]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Summarize required lanes
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          echo "$RESULTS"
+          if echo "$RESULTS" | jq -e 'to_entries[] | select(.value.result == "failure" or .value.result == "cancelled")' >/dev/null; then
+            exit 1
+          fi

@@ -1,0 +1,26 @@
+name: Feature request
+description: Suggest an API, runtime, or LLM client improvement.
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use case
+      description: What workflow should langoraph support better?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed API or behavior
+      description: Include code examples when the shape matters.
+      render: go
+    validations:
+      required: false
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
