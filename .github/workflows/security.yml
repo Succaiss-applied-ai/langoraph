@@ -28,12 +28,15 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Run govulncheck
         uses: golang/govulncheck-action@v1
         with:
           go-version-file: go.mod
           go-package: ./...
+          repo-checkout: false
 
   codeql:
     name: CodeQL
