@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: ["main"]
     types: [opened, synchronize, reopened, ready_for_review]
+  pull_request_target:
+    branches: ["main"]
+    types: [opened, reopened, ready_for_review]
   issue_comment:
     types: [created]
   workflow_dispatch:
@@ -38,8 +41,44 @@ permissions:
   pull-requests: write
 
 jobs:
+  request-codex-review:
+    name: Request Codex Review
+    if: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.draft != true && github.event.pull_request.user.type != 'Bot' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Ask Codex to review the PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const marker = "<!-- codex-auto-review-request -->";
+            const body = `${marker}\n@codex review`;
+            const issue_number = context.payload.pull_request.number;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number,
+              per_page: 100,
+            });
+            const existing = comments.find((comment) => comment.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number,
+                body,
+              });
+            }
+
   plan:
     name: Plan Codex Run
+    if: ${{ github.event_name != 'pull_request_target' }}
     runs-on: ubuntu-24.04
     outputs:
       base_ref: ${{ steps.plan.outputs.base_ref }}
@@ -144,7 +183,7 @@ jobs:
               }
             } else if (eventName === "issue_comment") {
               const body = context.payload.comment.body || "";
-              const isCommand = /(^|\s)(\/codex|@codex)\b/i.test(body);
+              const isCommand = /(^|\s)\/codex\b/i.test(body);
               if (isCommand) {
                 requestedByCommand = true;
                 if (!(await canTrigger())) {
@@ -278,5 +317,5 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: Number("${{ needs.plan.outputs.issue_number }}"),
-              body: "Codex automation is installed, but `OPENAI_API_KEY` is not configured as a repository secret. Add that secret to let `/codex` or `@codex` run through `openai/codex-action@v1`.",
+              body: "Codex automation is installed, but `OPENAI_API_KEY` is not configured as a repository secret. Add that secret to let `/codex` run through `openai/codex-action@v1`.",
             });
