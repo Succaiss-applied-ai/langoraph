@@ -1,0 +1,38 @@
+go:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*.go"
+          - "go.mod"
+          - "go.sum"
+
+llm:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "llm/**"
+
+graph:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "graph.go"
+          - "fanout.go"
+          - "*graph*_test.go"
+          - "*fanout*_test.go"
+          - "parallel_semantics_test.go"
+
+ci:
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".github/**"
+          - "Makefile"
+
+docs:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*.md"
+          - "docs/**"
+
+dependencies:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "go.mod"
+          - "go.sum"

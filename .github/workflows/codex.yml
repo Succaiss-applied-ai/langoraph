@@ -1,0 +1,282 @@
+name: Codex Automation
+
+on:
+  issues:
+    types: [opened, labeled]
+  pull_request:
+    branches: ["main"]
+    types: [opened, synchronize, reopened, ready_for_review]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Codex task type"
+        required: true
+        default: review
+        type: choice
+        options:
+          - review
+          - docs
+          - fix-ci
+      ref:
+        description: "Branch, tag, or SHA to inspect"
+        required: false
+        type: string
+      prompt:
+        description: "Task for Codex"
+        required: true
+        type: string
+
+concurrency:
+  group: codex-v1-${{ github.event.issue.number || github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  plan:
+    name: Plan Codex Run
+    runs-on: ubuntu-24.04
+    outputs:
+      base_ref: ${{ steps.plan.outputs.base_ref }}
+      checkout_ref: ${{ steps.plan.outputs.checkout_ref }}
+      has_key: ${{ steps.plan.outputs.has_key }}
+      issue_number: ${{ steps.plan.outputs.issue_number }}
+      mode: ${{ steps.plan.outputs.mode }}
+      prompt: ${{ steps.plan.outputs.prompt }}
+      requested_by_command: ${{ steps.plan.outputs.requested_by_command }}
+      should_run: ${{ steps.plan.outputs.should_run }}
+    steps:
+      - name: Decide whether Codex should run
+        id: plan
+        uses: actions/github-script@v7
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const fullName = `${owner}/${repo}`;
+            const eventName = context.eventName;
+            const hasKey = Boolean(process.env.OPENAI_API_KEY);
+
+            let shouldRun = false;
+            let requestedByCommand = false;
+            let mode = "review";
+            let issueNumber = "";
+            let checkoutRef = context.ref;
+            let baseRef = "main";
+            let prompt = "";
+
+            const canTrigger = async () => {
+              const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+                owner,
+                repo,
+                username: context.actor,
+              });
+              return ["admin", "maintain", "write"].includes(data.permission);
+            };
+
+            const reviewPrompt = (pr, commandMode) => [
+              `You are Codex reviewing ${fullName}.`,
+              "",
+              `Task: ${commandMode === "fix-ci" ? "diagnose CI failure risk and propose a precise fix plan" : "review the pull request diff"}.`,
+              "",
+              "Repository facts:",
+              "- This is a Go module for LangGraph-like graph execution and OpenAI-compatible LLM clients.",
+              "- Prefer local commands from AGENTS.md: gofmt, go vet ./..., go test ./..., go test -race ./...",
+              "- Unit tests must not require API keys; integration tests are opt-in.",
+              "",
+              "Pull request:",
+              `- Number: #${pr.number}`,
+              `- Title: ${pr.title}`,
+              `- Base: ${pr.base.ref} (${pr.base.sha})`,
+              `- Head: ${pr.head.ref} (${pr.head.sha})`,
+              "",
+              "Review only the PR changes. Return concise findings first, with file paths and line references when possible. If there are no actionable issues, say that and mention residual test risk. Do not modify files in this workflow.",
+            ].join("\n");
+
+            const issuePrompt = (issue, commandText = "") => [
+              `You are Codex triaging ${fullName}.`,
+              "",
+              "Task: analyze the issue and propose a concrete local implementation plan.",
+              "",
+              "Repository facts:",
+              "- This is a Go module for LangGraph-like graph execution and OpenAI-compatible LLM clients.",
+              "- Prefer local commands from AGENTS.md: gofmt, go vet ./..., go test ./..., go test -race ./...",
+              "- Unit tests must not require API keys; integration tests are opt-in.",
+              "",
+              "Issue:",
+              `- Number: #${issue.number}`,
+              `- Title: ${issue.title}`,
+              "",
+              "Issue body:",
+              issue.body || "(empty)",
+              "",
+              commandText ? `Maintainer command:\n${commandText}` : "",
+              "",
+              "Return a concise plan with risks, likely files, and tests. Do not modify files in this workflow.",
+            ].join("\n");
+
+            if (eventName === "issues") {
+              const issue = context.payload.issue;
+              const labels = issue.labels.map((label) => label.name);
+              if (!issue.pull_request && issue.state === "open" && labels.includes("codex")) {
+                shouldRun = true;
+                mode = "issue-triage";
+                issueNumber = String(issue.number);
+                checkoutRef = context.ref;
+                prompt = issuePrompt(issue);
+              }
+            } else if (eventName === "pull_request") {
+              const pr = context.payload.pull_request;
+              if (!pr.draft && pr.head.repo.full_name === fullName) {
+                shouldRun = true;
+                mode = "auto-review";
+                issueNumber = String(pr.number);
+                checkoutRef = `refs/pull/${pr.number}/merge`;
+                baseRef = pr.base.ref;
+                prompt = reviewPrompt(pr, mode);
+              }
+            } else if (eventName === "issue_comment") {
+              const body = context.payload.comment.body || "";
+              const isCommand = /(^|\s)(\/codex|@codex)\b/i.test(body);
+              if (isCommand) {
+                requestedByCommand = true;
+                if (!(await canTrigger())) {
+                  core.setFailed("Only users with write, maintain, or admin access can trigger Codex automation.");
+                } else if (context.payload.issue.pull_request) {
+                  const prNumber = context.payload.issue.number;
+                  const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+                  if (pr.head.repo.full_name === fullName) {
+                    shouldRun = true;
+                    mode = /fix|ci/i.test(body) ? "fix-ci" : "review";
+                    issueNumber = String(pr.number);
+                    checkoutRef = `refs/pull/${pr.number}/merge`;
+                    baseRef = pr.base.ref;
+                    prompt = reviewPrompt(pr, mode);
+                    prompt += `\n\nMaintainer command:\n${body}`;
+                  }
+                } else {
+                  const issue = context.payload.issue;
+                  shouldRun = true;
+                  mode = /fix|ci/i.test(body) ? "fix-ci" : "issue-triage";
+                  issueNumber = String(issue.number);
+                  checkoutRef = context.ref;
+                  prompt = issuePrompt(issue, body);
+                }
+              }
+            } else if (eventName === "workflow_dispatch") {
+              shouldRun = true;
+              requestedByCommand = true;
+              mode = core.getInput("mode") || "review";
+              checkoutRef = core.getInput("ref") || context.ref;
+              prompt = [
+                `You are Codex working on ${fullName}.`,
+                "",
+                `Mode: ${mode}`,
+                "",
+                "Follow AGENTS.md. Prefer read-only analysis in this workflow and return a concise implementation or review plan.",
+                "",
+                "User task:",
+                core.getInput("prompt"),
+              ].join("\n");
+            }
+
+            core.setOutput("should_run", String(shouldRun));
+            core.setOutput("requested_by_command", String(requestedByCommand));
+            core.setOutput("has_key", String(hasKey));
+            core.setOutput("mode", mode);
+            core.setOutput("issue_number", issueNumber);
+            core.setOutput("checkout_ref", checkoutRef);
+            core.setOutput("base_ref", baseRef);
+            core.setOutput("prompt", prompt);
+
+  run:
+    name: Run Codex
+    needs: plan
+    if: ${{ needs.plan.outputs.should_run == 'true' && needs.plan.outputs.has_key == 'true' }}
+    runs-on: ubuntu-24.04
+    outputs:
+      final_message: ${{ steps.codex.outputs.final-message }}
+    steps:
+      - name: Check out target ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.checkout_ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Capture local smoke output
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          mkdir -p .codex
+          go test ./... 2>&1 | tee .codex/go-test.txt
+
+      - name: Run Codex
+        id: codex
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          model: ${{ vars.CODEX_MODEL }}
+          effort: ${{ vars.CODEX_EFFORT || 'medium' }}
+          sandbox: read-only
+          prompt: |
+            ${{ needs.plan.outputs.prompt }}
+
+            Local smoke output is available at .codex/go-test.txt.
+
+      - name: Publish Codex feedback
+        if: ${{ needs.plan.outputs.issue_number != '' && steps.codex.outputs.final-message != '' }}
+        uses: actions/github-script@v7
+        env:
+          CODEX_FINAL_MESSAGE: ${{ steps.codex.outputs.final-message }}
+          ISSUE_NUMBER: ${{ needs.plan.outputs.issue_number }}
+          MODE: ${{ needs.plan.outputs.mode }}
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number(process.env.ISSUE_NUMBER),
+              body: `<!-- codex-automation -->\n### Codex ${process.env.MODE}\n\n${process.env.CODEX_FINAL_MESSAGE}`,
+            });
+
+      - name: Add run summary
+        if: ${{ steps.codex.outputs.final-message != '' }}
+        env:
+          CODEX_FINAL_MESSAGE: ${{ steps.codex.outputs.final-message }}
+        run: |
+          {
+            echo "## Codex result"
+            echo
+            echo "$CODEX_FINAL_MESSAGE"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  missing-secret:
+    name: Codex Secret Notice
+    needs: plan
+    if: ${{ needs.plan.outputs.should_run == 'true' && needs.plan.outputs.has_key != 'true' && needs.plan.outputs.requested_by_command == 'true' && needs.plan.outputs.issue_number != '' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Tell maintainer how to enable Codex automation
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number("${{ needs.plan.outputs.issue_number }}"),
+              body: "Codex automation is installed, but `OPENAI_API_KEY` is not configured as a repository secret. Add that secret to let `/codex` or `@codex` run through `openai/codex-action@v1`.",
+            });
