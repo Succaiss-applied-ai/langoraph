@@ -47,7 +47,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Ask Codex to review the PR
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const marker = "<!-- codex-auto-review-request -->";
@@ -92,7 +92,7 @@ jobs:
     steps:
       - name: Decide whether Codex should run
         id: plan
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         with:
@@ -278,7 +278,7 @@ jobs:
 
       - name: Publish Codex feedback
         if: ${{ needs.plan.outputs.issue_number != '' && steps.codex.outputs.final-message != '' }}
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           CODEX_FINAL_MESSAGE: ${{ steps.codex.outputs.final-message }}
           ISSUE_NUMBER: ${{ needs.plan.outputs.issue_number }}
@@ -310,7 +310,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Tell maintainer how to enable Codex automation
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             await github.rest.issues.createComment({
