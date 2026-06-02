@@ -87,6 +87,7 @@ type openAIClient struct {
 	defaultSeed                 *int
 	defaultMaxTokens            *int
 	defaultEnableThinking       bool
+	defaultReasoningEffort      string
 	defaultStream               bool
 	defaultFirstTokenTimeout    time.Duration
 	defaultFirstTokenMaxRetries int
@@ -110,6 +111,8 @@ type chatRequest struct {
 	// Sending it nested under "extra_body" is silently ignored by DashScope, causing the model
 	// to default to thinking=true and generate thousands of slow reasoning tokens.
 	EnableThinking *bool `json:"enable_thinking,omitempty"`
+	// ReasoningEffort is a DashScope/DeepSeek top-level extension for DeepSeek thinking depth.
+	ReasoningEffort *string `json:"reasoning_effort,omitempty"`
 }
 
 type streamOptions struct {
@@ -180,6 +183,7 @@ func newOpenAIClient(baseURL, apiKey, model string, cfg Config) *openAIClient {
 		timeoutSeconds:              cfg.TimeoutSeconds,
 		defaultTemperature:          cfg.Temperature,
 		defaultEnableThinking:       cfg.EnableThinking,
+		defaultReasoningEffort:      cfg.ReasoningEffort,
 		defaultStream:               cfg.Stream,
 		defaultFirstTokenTimeout:    cfg.FirstTokenTimeout,
 		defaultFirstTokenMaxRetries: cfg.FirstTokenMaxRetries,
@@ -239,7 +243,7 @@ func (c *openAIClient) buildRequest(messages []Message, o chatOpts) chatRequest 
 		req.StreamOptions = &streamOptions{IncludeUsage: true}
 	}
 
-	// DashScope / DeepSeek: send enable_thinking as a TOP-LEVEL field.
+	// DashScope / DeepSeek: send thinking controls as TOP-LEVEL fields.
 	// Python's openai SDK extra_body merges into top-level — we must do the same.
 	// Nesting it under "extra_body" key is silently ignored by DashScope, causing
 	// qwen3.5-flash to default to thinking=true and generate ~5000 slow reasoning tokens.
@@ -250,11 +254,20 @@ func (c *openAIClient) buildRequest(messages []Message, o chatOpts) chatRequest 
 			t = *o.enableThinking
 		}
 		req.EnableThinking = &t
+		if effort := c.defaultReasoningEffort; effort != "" {
+			req.ReasoningEffort = &effort
+		}
+		if o.reasoningEffort != nil {
+			req.ReasoningEffort = o.reasoningEffort
+		}
 	} else if o.enableThinking != nil {
 		// Caller explicitly opted in for a non-Aliyun endpoint; honour it
 		// even though most providers will silently ignore the field.
 		t := *o.enableThinking
 		req.EnableThinking = &t
+	}
+	if !strings.Contains(lower, "dashscope") && !strings.Contains(lower, "deepseek") && o.reasoningEffort != nil {
+		req.ReasoningEffort = o.reasoningEffort
 	}
 	return req
 }
@@ -415,6 +428,9 @@ type Config struct {
 	Temperature    float64
 	TimeoutSeconds int
 	EnableThinking bool
+	// ReasoningEffort is sent as DashScope/DeepSeek top-level reasoning_effort
+	// when non-empty, e.g. "low", "medium", or "high".
+	ReasoningEffort string
 
 	// --- Streaming defaults (per-call WithStream / WithFirstTokenTimeout
 	//     / WithFirstTokenMaxRetries override these) ---

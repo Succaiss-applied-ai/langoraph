@@ -181,7 +181,7 @@ resp, err := client.Chat(ctx, msgs,
 )
 ```
 
-Available options: `WithStream`, `WithTemperature`, `WithTopP`, `WithSeed`, `WithMaxTokens`, `WithEnableThinking`, `WithFirstTokenTimeout`, `WithFirstTokenMaxRetries`.
+Available options: `WithStream`, `WithTemperature`, `WithTopP`, `WithSeed`, `WithMaxTokens`, `WithEnableThinking`, `WithReasoningEffort`, `WithFirstTokenTimeout`, `WithFirstTokenMaxRetries`.
 
 ### Feedback-driven validation retry
 

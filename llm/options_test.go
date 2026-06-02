@@ -149,6 +149,39 @@ func TestOptions_Override_Sampling(t *testing.T) {
 	}
 }
 
+func TestOptions_ReasoningEffort_DashScopeWirePayload(t *testing.T) {
+	srv, rec := captureServer(t)
+	c := stubClient(t, srv.URL+"/dashscope", Config{
+		EnableThinking:  true,
+		ReasoningEffort: "low",
+	})
+
+	if _, err := c.Chat(context.Background(), []Message{{Role: "user", Content: "hi"}}); err != nil {
+		t.Fatalf("default Chat failed: %v", err)
+	}
+	def := rec.last()
+	if def["enable_thinking"] != true {
+		t.Errorf("default enable_thinking: expected true, got %v", def["enable_thinking"])
+	}
+	if def["reasoning_effort"] != "low" {
+		t.Errorf("default reasoning_effort: expected low, got %v", def["reasoning_effort"])
+	}
+
+	if _, err := c.Chat(context.Background(), []Message{{Role: "user", Content: "hi"}},
+		WithEnableThinking(false),
+		WithReasoningEffort("high"),
+	); err != nil {
+		t.Fatalf("override Chat failed: %v", err)
+	}
+	ov := rec.last()
+	if ov["enable_thinking"] != false {
+		t.Errorf("override enable_thinking: expected false, got %v", ov["enable_thinking"])
+	}
+	if ov["reasoning_effort"] != "high" {
+		t.Errorf("override reasoning_effort: expected high, got %v", ov["reasoning_effort"])
+	}
+}
+
 // ----- TestOptions_OmitsZeroDefaults -----
 // Config zero values for top_p / seed / max_tokens must not appear in
 // the wire payload (so providers fall back to their own defaults).
