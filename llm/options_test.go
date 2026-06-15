@@ -282,25 +282,27 @@ func TestOptions_FirstTokenWatchdog_Defaults(t *testing.T) {
 	c := newOpenAIClient("https://example.invalid", "k", "m", Config{
 		FirstTokenTimeout:    5 * time.Second,
 		FirstTokenMaxRetries: 2,
+		ChunkIdleTimeout:     20 * time.Second,
 	})
 
-	t1, r1 := c.resolveStreamWatchdog(applyOptions(nil))
-	if t1 != 5*time.Second || r1 != 2 {
-		t.Errorf("expected defaults (5s, 2), got (%s, %d)", t1, r1)
+	t1, r1, idle1 := c.resolveStreamWatchdog(applyOptions(nil))
+	if t1 != 5*time.Second || r1 != 2 || idle1 != 20*time.Second {
+		t.Errorf("expected defaults (5s, 2, 20s), got (%s, %d, %s)", t1, r1, idle1)
 	}
 
-	t2, r2 := c.resolveStreamWatchdog(applyOptions([]ChatOption{
+	t2, r2, idle2 := c.resolveStreamWatchdog(applyOptions([]ChatOption{
 		WithFirstTokenTimeout(2 * time.Second),
 		WithFirstTokenMaxRetries(5),
+		WithChunkIdleTimeout(3 * time.Second),
 	}))
-	if t2 != 2*time.Second || r2 != 5 {
-		t.Errorf("expected overrides (2s, 5), got (%s, %d)", t2, r2)
+	if t2 != 2*time.Second || r2 != 5 || idle2 != 3*time.Second {
+		t.Errorf("expected overrides (2s, 5, 3s), got (%s, %d, %s)", t2, r2, idle2)
 	}
 
-	t3, r3 := c.resolveStreamWatchdog(applyOptions([]ChatOption{
+	t3, r3, idle3 := c.resolveStreamWatchdog(applyOptions([]ChatOption{
 		WithFirstTokenMaxRetries(-3),
 	}))
-	if t3 != 5*time.Second || r3 != 0 {
-		t.Errorf("expected (5s, 0) after clamping negative retries, got (%s, %d)", t3, r3)
+	if t3 != 5*time.Second || r3 != 0 || idle3 != 20*time.Second {
+		t.Errorf("expected (5s, 0, 20s) after clamping negative retries, got (%s, %d, %s)", t3, r3, idle3)
 	}
 }

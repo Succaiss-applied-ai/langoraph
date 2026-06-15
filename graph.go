@@ -194,15 +194,15 @@ func (g *Graph[S]) Run(ctx context.Context, state *S) error {
 // "Parallel semantics" doc-block above).
 //
 //   - With ErrorRecorder: all branches run; errors are funnelled
-//     through ``RecordError`` under an internal mutex so user
+//     through `RecordError` under an internal mutex so user
 //     recorders can stay racy-but-simple (e.g. a slice append).
-//     ``runParallel`` always returns nil so execution flows to ``then``.
+//     `runParallel` always returns nil so execution flows to `then`.
 //   - Without ErrorRecorder: all branches still run to completion;
-//     ``runParallel`` then returns the first non-nil error in the
-//     original ``branches`` slice order, making the returned error
+//     `runParallel` then returns the first non-nil error in the
+//     original `branches` slice order, making the returned error
 //     deterministic across runs.
 //
-// The shared ``ctx`` is never cancelled by ``runParallel`` itself —
+// The shared `ctx` is never cancelled by `runParallel` itself —
 // sibling branches keep running even after a peer errors. This matches
 // LangGraph and avoids leaking in-flight LLM calls when a single sub-
 // task fails fast.
@@ -217,6 +217,18 @@ func (g *Graph[S]) runParallel(ctx context.Context, state *S, pe parallelEdge, r
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					err := recoveredPanicError(fmt.Sprintf("node %q", name), r)
+					if canRecord {
+						recordMu.Lock()
+						recorder.RecordError(name, err)
+						recordMu.Unlock()
+						return
+					}
+					branchErrs[i] = err
+				}
+			}()
 			err := g.nodes[name](ctx, state)
 			if err == nil {
 				return
@@ -242,7 +254,6 @@ func (g *Graph[S]) runParallel(ctx context.Context, state *S, pe parallelEdge, r
 	}
 	return nil
 }
-
 
 // resolveNext returns the next node name after from. It checks fixed edges
 // first, then conditional edges. Returns "" if no edge is found.
@@ -329,13 +340,13 @@ func (g *Graph[S]) validate() error {
 // Parallel semantics — DELIBERATELY MATCHES LangGraph
 // ---------------------------------------------------
 // Every state's graph runs to its natural completion regardless of
-// sibling failures. The shared ``ctx`` is **never** cancelled by
-// RunAll itself; an external cancellation of ``ctx`` still aborts every
+// sibling failures. The shared `ctx` is **never** cancelled by
+// RunAll itself; an external cancellation of `ctx` still aborts every
 // in-flight graph. After all graphs return, RunAll returns the first
 // non-nil error in the order states appear in the input slice.
 //
 // This matches the "wait-all, deterministic-first-error" contract used
-// by ``Fanout`` and ``Graph.runParallel``, so callers get the same
+// by `Fanout` and `Graph.runParallel`, so callers get the same
 // behaviour whether they fan out items, parallel-edge branches, or
 // whole graphs.
 func RunAll[S any](ctx context.Context, g *Graph[S], states []*S) error {

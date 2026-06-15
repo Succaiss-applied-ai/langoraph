@@ -7,8 +7,8 @@ import "time"
 // Options are applied on top of the defaults captured in Config when
 // the Client was constructed. An unset option leaves the default in
 // place; a set option overrides it for that one call only. This is
-// the same pattern Python's “chat_completion(**kwargs)“ uses, where
-// “temperature=None“ falls back to “settings.llm_temperature“.
+// the same pattern Python's `chat_completion(**kwargs)` uses, where
+// `temperature=None` falls back to `settings.llm_temperature`.
 //
 // Example:
 //
@@ -29,9 +29,11 @@ type chatOpts struct {
 	seed                 *int
 	maxTokens            *int
 	enableThinking       *bool
+	thinkingBudget       *int
 	reasoningEffort      *string
 	firstTokenTimeout    *time.Duration
 	firstTokenMaxRetries *int
+	chunkIdleTimeout     *time.Duration
 }
 
 // applyOptions returns a chatOpts populated by every supplied option.
@@ -60,7 +62,7 @@ func WithStream(stream bool) ChatOption {
 }
 
 // WithTemperature overrides the sampling temperature for one call.
-// LangGraph parity: matches Python's per-call “temperature=...“.
+// LangGraph parity: matches Python's per-call `temperature=...`.
 func WithTemperature(t float64) ChatOption {
 	return func(o *chatOpts) { o.temperature = &t }
 }
@@ -83,7 +85,7 @@ func WithMaxTokens(n int) ChatOption {
 	return func(o *chatOpts) { o.maxTokens = &n }
 }
 
-// WithEnableThinking overrides DashScope/DeepSeek's “enable_thinking“
+// WithEnableThinking overrides DashScope/DeepSeek's `enable_thinking`
 // extension for one call. Useful for selectively turning thinking off
 // on a per-call basis (e.g. a fast-path classifier inside an otherwise
 // thinking-mode pipeline).
@@ -91,7 +93,12 @@ func WithEnableThinking(b bool) ChatOption {
 	return func(o *chatOpts) { o.enableThinking = &b }
 }
 
-// WithReasoningEffort overrides DashScope/DeepSeek's “reasoning_effort“
+// WithThinkingBudget overrides DashScope/Ark's thinking_budget extension.
+func WithThinkingBudget(n int) ChatOption {
+	return func(o *chatOpts) { o.thinkingBudget = &n }
+}
+
+// WithReasoningEffort overrides DashScope/DeepSeek's `reasoning_effort`
 // extension for one call. Valid provider values are model-dependent, but
 // DashScope DeepSeek models accept "", "low", "medium", and "high".
 func WithReasoningEffort(effort string) ChatOption {
@@ -99,7 +106,7 @@ func WithReasoningEffort(effort string) ChatOption {
 }
 
 // WithFirstTokenTimeout overrides how long the streaming layer will
-// wait for the first “content“ (or “reasoning_content“ heartbeat)
+// wait for the first `content` (or `reasoning_content` heartbeat)
 // SSE delta before declaring the upstream stalled. Only meaningful in
 // streaming mode.
 //
@@ -116,4 +123,10 @@ func WithFirstTokenTimeout(d time.Duration) ChatOption {
 // retry logic are layered on top.
 func WithFirstTokenMaxRetries(n int) ChatOption {
 	return func(o *chatOpts) { o.firstTokenMaxRetries = &n }
+}
+
+// WithChunkIdleTimeout overrides the maximum gap allowed between two
+// successive SSE chunks. A non-positive value disables the watchdog.
+func WithChunkIdleTimeout(d time.Duration) ChatOption {
+	return func(o *chatOpts) { o.chunkIdleTimeout = &d }
 }

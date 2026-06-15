@@ -249,6 +249,43 @@ func TestStreaming_FirstTokenTimeout_PerCallOverride(t *testing.T) {
 	}
 }
 
+// ----- TestStreaming_ChunkIdleTimeout -----
+// Once the stream is established, any long gap between two chunks must
+// fail fast instead of waiting for the total request deadline.
+
+func TestStreaming_ChunkIdleTimeout(t *testing.T) {
+	srv := streamServer(t, func(w http.ResponseWriter, r *http.Request) {
+		s := newSSEWriter(w)
+		s.write(contentDelta("first"))
+		select {
+		case <-time.After(2 * time.Second):
+		case <-r.Context().Done():
+		}
+	})
+
+	c := stubClient(t, srv.URL, Config{
+		Stream:               true,
+		FirstTokenTimeout:    time.Second,
+		FirstTokenMaxRetries: 0,
+		ChunkIdleTimeout:     120 * time.Millisecond,
+	})
+
+	start := time.Now()
+	_, err := c.Chat(context.Background(), []Message{{Role: "user", Content: "hi"}})
+	elapsed := time.Since(start)
+
+	var idle *ChunkIdleTimeoutError
+	if !errors.As(err, &idle) {
+		t.Fatalf("expected *ChunkIdleTimeoutError, got %T: %v", err, err)
+	}
+	if idle.Budget != 120*time.Millisecond {
+		t.Errorf("Budget: expected 120ms, got %s", idle.Budget)
+	}
+	if elapsed > time.Second {
+		t.Errorf("expected fast idle timeout, took %s", elapsed)
+	}
+}
+
 // ----- TestStreaming_NoTimeoutWhenDisabled -----
 // FirstTokenTimeout<=0 means watchdog is disabled; the request proceeds
 // (and finishes when the upstream sends [DONE]) without any timeout.
