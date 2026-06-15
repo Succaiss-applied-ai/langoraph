@@ -42,7 +42,9 @@ func loadEnv(t *testing.T) {
 			key := strings.TrimSpace(parts[0])
 			val := strings.Trim(strings.TrimSpace(parts[1]), `"'`)
 			if os.Getenv(key) == "" { // don't overwrite existing env
-				os.Setenv(key, val)
+				if err := os.Setenv(key, val); err != nil {
+					t.Fatalf("set env %s: %v", key, err)
+				}
 			}
 		}
 		t.Logf("loaded .env from %s", candidate)

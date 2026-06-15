@@ -129,9 +129,9 @@ func fixJSON(s string) string {
 }
 
 var (
-	reFence        = regexp.MustCompile("```(?:json)?\\s*([\\s\\S]*?)```")
-	reLineComment  = regexp.MustCompile(`(?m)//.*?$`)
-	reBlockComment = regexp.MustCompile(`(?s)/\*.*?\*/`)
+	reFence         = regexp.MustCompile("```(?:json)?\\s*([\\s\\S]*?)```")
+	reLineComment   = regexp.MustCompile(`(?m)//.*?$`)
+	reBlockComment  = regexp.MustCompile(`(?s)/\*.*?\*/`)
 	reTrailingComma = regexp.MustCompile(`,\s*([}\]])`)
 )
 

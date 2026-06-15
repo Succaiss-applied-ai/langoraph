@@ -3,8 +3,11 @@ package langoraph_test
 import (
 	"context"
 	"errors"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	langoraph "github.com/Succaiss-applied-ai/langoraph"
 )
@@ -43,30 +46,55 @@ func TestFanout_ResultsInOrder(t *testing.T) {
 func TestFanout_ActuallyParallel(t *testing.T) {
 	var active int64
 	var maxActive int64
+	ready := make(chan struct{}, 20)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
 
 	items := make([]int, 20)
 	for i := range items {
 		items[i] = i
 	}
 
-	_, err := langoraph.Fanout(
-		context.Background(),
-		items,
-		func(ctx context.Context, n int) (int, error) {
-			cur := atomic.AddInt64(&active, 1)
-			for {
-				old := atomic.LoadInt64(&maxActive)
-				if cur <= old || atomic.CompareAndSwapInt64(&maxActive, old, cur) {
-					break
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	defer releaseOnce.Do(func() { close(release) })
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := langoraph.Fanout(
+			ctx,
+			items,
+			func(ctx context.Context, n int) (int, error) {
+				cur := atomic.AddInt64(&active, 1)
+				for {
+					old := atomic.LoadInt64(&maxActive)
+					if cur <= old || atomic.CompareAndSwapInt64(&maxActive, old, cur) {
+						break
+					}
 				}
-			}
-			done := make(chan struct{})
-			go func() { close(done) }()
-			<-done
-			atomic.AddInt64(&active, -1)
-			return n, nil
-		},
-	)
+				ready <- struct{}{}
+				select {
+				case <-release:
+				case <-ctx.Done():
+					return 0, ctx.Err()
+				}
+				atomic.AddInt64(&active, -1)
+				return n, nil
+			},
+		)
+		errCh <- err
+	}()
+
+	for range items {
+		select {
+		case <-ready:
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for fanout workers: %v", ctx.Err())
+		}
+	}
+	releaseOnce.Do(func() { close(release) })
+
+	err := <-errCh
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,6 +127,31 @@ func TestFanout_ErrorStopsAndPropagates(t *testing.T) {
 	}
 	if !errors.Is(err, sentinel) {
 		t.Errorf("expected sentinel error, got: %v", err)
+	}
+}
+
+func TestFanout_PanicBecomesError(t *testing.T) {
+	items := []int{1, 2, 3}
+
+	results, err := langoraph.Fanout(
+		context.Background(),
+		items,
+		func(_ context.Context, n int) (int, error) {
+			if n == 2 {
+				panic("branch exploded")
+			}
+			return n * 10, nil
+		},
+	)
+
+	if err == nil {
+		t.Fatal("expected panic to be converted into error")
+	}
+	if !strings.Contains(err.Error(), "fanout branch panic: branch exploded") {
+		t.Fatalf("unexpected panic error: %v", err)
+	}
+	if results[0] != 10 || results[2] != 30 {
+		t.Fatalf("sibling results should be preserved, got %+v", results)
 	}
 }
 

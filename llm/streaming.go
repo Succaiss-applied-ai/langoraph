@@ -17,11 +17,11 @@ import (
 
 // FirstTokenTimeoutError is returned by the streaming chat path when
 // the watchdog fires before any content (or reasoning_content) delta
-// arrives. It is a TimeoutError so callers can use “errors.Is(err,
-// context.DeadlineExceeded)“-style probing without a special branch.
+// arrives. It is a TimeoutError so callers can use `errors.Is(err,
+// context.DeadlineExceeded)`-style probing without a special branch.
 //
-// Mirrors Python's “LLMFirstTokenTimeout“ from
-// “app/llm/dashscope_client.py“.
+// Mirrors Python's `LLMFirstTokenTimeout` from
+// `app/llm/dashscope_client.py`.
 type FirstTokenTimeoutError struct {
 	Budget time.Duration
 	Model  string
@@ -34,6 +34,20 @@ func (e *FirstTokenTimeoutError) Error() string {
 // Timeout reports true so this error type integrates with net.Error /
 // generic timeout-detection callers without an explicit type assertion.
 func (e *FirstTokenTimeoutError) Timeout() bool { return true }
+
+// ChunkIdleTimeoutError is returned when an established SSE stream stops
+// producing chunks for longer than the configured idle budget.
+type ChunkIdleTimeoutError struct {
+	Budget time.Duration
+	Model  string
+}
+
+func (e *ChunkIdleTimeoutError) Error() string {
+	return fmt.Sprintf("llm: stream chunk idle timeout after %s (model=%s)", e.Budget, e.Model)
+}
+
+// Timeout reports true so callers can classify this as a timeout.
+func (e *ChunkIdleTimeoutError) Timeout() bool { return true }
 
 // streamChunk is the OpenAI/DashScope SSE delta wire shape we care about.
 type streamChunk struct {
@@ -68,6 +82,7 @@ func (c *openAIClient) chatStream(
 	req chatRequest,
 	firstTokenTimeout time.Duration,
 	firstTokenMaxRetries int,
+	chunkIdleTimeout time.Duration,
 ) (*Response, error) {
 	maxAttempts := firstTokenMaxRetries + 1
 	if maxAttempts < 1 {
@@ -76,7 +91,7 @@ func (c *openAIClient) chatStream(
 
 	var lastTimeout *FirstTokenTimeoutError
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		resp, err := c.streamOnce(ctx, req, firstTokenTimeout)
+		resp, err := c.streamOnce(ctx, req, firstTokenTimeout, chunkIdleTimeout)
 		if err == nil {
 			return resp, nil
 		}
@@ -108,6 +123,7 @@ func (c *openAIClient) streamOnce(
 	ctx context.Context,
 	req chatRequest,
 	firstTokenTimeout time.Duration,
+	chunkIdleTimeout time.Duration,
 ) (*Response, error) {
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -134,7 +150,7 @@ func (c *openAIClient) streamOnce(
 		}
 		return nil, fmt.Errorf("llm: http stream request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(resp.Body)
@@ -143,14 +159,19 @@ func (c *openAIClient) streamOnce(
 
 	wd := newFirstTokenWatchdog(resp.Body, firstTokenTimeout)
 	defer wd.stop()
+	idle := newChunkIdleWatchdog(resp.Body, chunkIdleTimeout)
+	defer idle.stop()
 
-	parts, reasoningParts, usage, parseErr := parseSSEStream(resp.Body, wd)
+	parts, reasoningParts, usage, parseErr := parseSSEStream(resp.Body, wd, idle)
 
 	// Watchdog wins: surface as a typed first-token timeout. The CAS
 	// inside the watchdog guarantees exactly one of {timer fires,
 	// first delta seen} succeeds, so this branch is unambiguous.
 	if wd.timedOut() {
 		return nil, &FirstTokenTimeoutError{Budget: firstTokenTimeout, Model: c.model}
+	}
+	if idle.timedOut() {
+		return nil, &ChunkIdleTimeoutError{Budget: chunkIdleTimeout, Model: c.model}
 	}
 
 	if parseErr != nil && !errors.Is(parseErr, io.EOF) {
@@ -160,6 +181,9 @@ func (c *openAIClient) streamOnce(
 		if errors.Is(parseErr, io.ErrUnexpectedEOF) || errors.Is(parseErr, errBodyClosed) {
 			if wd.timedOut() {
 				return nil, &FirstTokenTimeoutError{Budget: firstTokenTimeout, Model: c.model}
+			}
+			if idle.timedOut() {
+				return nil, &ChunkIdleTimeoutError{Budget: chunkIdleTimeout, Model: c.model}
 			}
 		}
 		return nil, fmt.Errorf("llm: stream read: %w", parseErr)
@@ -185,7 +209,7 @@ func (c *openAIClient) streamOnce(
 var errBodyClosed = errors.New("llm: response body closed by watchdog")
 
 // firstTokenWatchdog aborts the SSE response body if the first content
-// (or reasoning_content) delta does not arrive within “timeout“.
+// (or reasoning_content) delta does not arrive within `timeout`.
 // Exactly one of {timer fires, first-token-arrived} wins via an atomic
 // CAS, so callers cannot observe a half-armed state.
 type firstTokenWatchdog struct {
@@ -197,10 +221,10 @@ type firstTokenWatchdog struct {
 	once     sync.Once
 }
 
-// newFirstTokenWatchdog returns a watchdog that will Close “body“
-// after “timeout“ unless “signalFirstToken“ is called first.
+// newFirstTokenWatchdog returns a watchdog that will Close `body`
+// after `timeout` unless `signalFirstToken` is called first.
 // A non-positive timeout disables the watchdog entirely (all signal
-// calls become no-ops, “timedOut“ is always false).
+// calls become no-ops, `timedOut` is always false).
 func newFirstTokenWatchdog(body io.Closer, timeout time.Duration) *firstTokenWatchdog {
 	wd := &firstTokenWatchdog{body: body}
 	if timeout <= 0 {
@@ -250,6 +274,85 @@ func (w *firstTokenWatchdog) timedOut() bool {
 	return w.tripped.Load()
 }
 
+// chunkIdleWatchdog aborts the SSE response body when no chunk arrives
+// within the configured inter-chunk idle budget.
+type chunkIdleWatchdog struct {
+	timer      *time.Timer
+	body       io.Closer
+	timeout    time.Duration
+	generation atomic.Uint64
+	tripped    atomic.Bool
+	disabled   bool
+	mu         sync.Mutex
+	stopped    bool
+}
+
+func newChunkIdleWatchdog(body io.Closer, timeout time.Duration) *chunkIdleWatchdog {
+	wd := &chunkIdleWatchdog{body: body, timeout: timeout}
+	if timeout <= 0 {
+		wd.disabled = true
+		return wd
+	}
+	wd.armLocked()
+	return wd
+}
+
+func (w *chunkIdleWatchdog) armLocked() {
+	generation := w.generation.Add(1)
+	if w.timer != nil {
+		w.timer.Stop()
+	}
+	w.timer = time.AfterFunc(w.timeout, func() {
+		w.trip(generation)
+	})
+}
+
+func (w *chunkIdleWatchdog) trip(generation uint64) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.stopped || w.disabled {
+		return
+	}
+	if generation != w.generation.Load() {
+		return
+	}
+	w.stopped = true
+	w.tripped.Store(true)
+	_ = w.body.Close()
+}
+
+func (w *chunkIdleWatchdog) signalActivity() {
+	if w.disabled {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.stopped || w.tripped.Load() {
+		return
+	}
+	w.armLocked()
+}
+
+func (w *chunkIdleWatchdog) stop() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.stopped {
+		return
+	}
+	w.stopped = true
+	w.generation.Add(1)
+	if w.timer != nil {
+		w.timer.Stop()
+	}
+}
+
+func (w *chunkIdleWatchdog) timedOut() bool {
+	if w.disabled {
+		return false
+	}
+	return w.tripped.Load()
+}
+
 // isFirstTokenTimeoutErr reports whether a transport error captured
 // before any SSE delta was received should be treated as a first-token
 // timeout. We only honour this when a positive timeout is configured;
@@ -272,20 +375,20 @@ func isFirstTokenTimeoutErr(ctx context.Context, err error, timeout time.Duratio
 // parseSSEStream consumes the OpenAI / DashScope event-stream wire
 // format and returns:
 //
-//   - parts: every “delta.content“ chunk, in arrival order, ready to
+//   - parts: every `delta.content` chunk, in arrival order, ready to
 //     join into the final response Content.
-//   - reasoningParts: every “delta.reasoning_content“ chunk for the
+//   - reasoningParts: every `delta.reasoning_content` chunk for the
 //     thinking-model trace (kept separate so callers don't accidentally
 //     concatenate them into the user-facing Content).
 //   - usage: the populated usage block from the final usage-only chunk
-//     (DashScope sends one when “stream_options.include_usage=true“);
+//     (DashScope sends one when `stream_options.include_usage=true`);
 //     nil when the provider does not emit it.
 //
 // The watchdog is disarmed the first time **either** a content delta
 // or a reasoning_content delta is observed — matching the Python
 // "thinking-model heartbeat" path so deepseek-v4-pro / qwen-deepseek
 // thinking bursts do not falsely time out.
-func parseSSEStream(body io.Reader, wd *firstTokenWatchdog) (
+func parseSSEStream(body io.Reader, wd *firstTokenWatchdog, idle *chunkIdleWatchdog) (
 	parts []string, reasoningParts []string, usage *streamChunkUsage, err error,
 ) {
 	scanner := bufio.NewScanner(body)
@@ -299,6 +402,7 @@ func parseSSEStream(body io.Reader, wd *firstTokenWatchdog) (
 		if !strings.HasPrefix(line, "data:") {
 			continue
 		}
+		idle.signalActivity()
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if payload == "" || payload == "[DONE]" {
 			if payload == "[DONE]" {

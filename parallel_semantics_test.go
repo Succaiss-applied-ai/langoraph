@@ -1,12 +1,12 @@
 // Tests pinning langoraph's parallel semantics to LangGraph parity:
 //
-//   1. All siblings run to completion even when a peer errors
-//      (no errgroup-style early cancellation).
-//   2. The first error in input/branch order wins, deterministically.
-//   3. ErrorRecorder.RecordError is called under an internal mutex so
-//      user recorders do not need their own locking.
-//   4. RunAll obeys the same wait-all + deterministic-first-error
-//      contract as Fanout / Graph.runParallel.
+//  1. All siblings run to completion even when a peer errors
+//     (no errgroup-style early cancellation).
+//  2. The first error in input/branch order wins, deterministically.
+//  3. ErrorRecorder.RecordError is called under an internal mutex so
+//     user recorders do not need their own locking.
+//  4. RunAll obeys the same wait-all + deterministic-first-error
+//     contract as Fanout / Graph.runParallel.
 //
 // These tests are the load-bearing contract for the "all parallelism
 // matches LangGraph" guarantee documented in graph.go and fanout.go.
@@ -190,6 +190,36 @@ func TestGraph_ParallelEdge_DeterministicFirstError(t *testing.T) {
 	}
 }
 
+func TestGraph_ParallelEdge_PanicBecomesError_Strict(t *testing.T) {
+	type strictState struct {
+		done int64
+	}
+
+	g := langoraph.NewGraph[strictState]()
+	g.AddNode("entry", func(_ context.Context, _ *strictState) error { return nil })
+	g.AddNode("panic_branch", func(_ context.Context, _ *strictState) error {
+		panic("parallel branch exploded")
+	})
+	g.AddNode("ok_branch", func(_ context.Context, s *strictState) error {
+		atomic.AddInt64(&s.done, 1)
+		return nil
+	})
+	g.AddNode("after", func(_ context.Context, _ *strictState) error { return nil })
+
+	g.AddEdge(langoraph.START, "entry")
+	g.AddParallelEdge("entry", []string{"panic_branch", "ok_branch"}, "after")
+	g.AddEdge("after", langoraph.END)
+
+	state := &strictState{}
+	err := g.Run(context.Background(), state)
+	if err == nil || !contains(err.Error(), `node "panic_branch" panic: parallel branch exploded`) {
+		t.Fatalf("expected panic branch error, got %v", err)
+	}
+	if got := atomic.LoadInt64(&state.done); got != 1 {
+		t.Fatalf("expected sibling branch to complete, got %d", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Graph.runParallel: ErrorRecorder is serialised
 // ---------------------------------------------------------------------------
@@ -226,6 +256,33 @@ func TestGraph_ParallelEdge_ErrorRecorder_Serialised(t *testing.T) {
 	}
 	if state.completed != 1 {
 		t.Errorf("expected after node to run exactly once, got %d", state.completed)
+	}
+}
+
+func TestGraph_ParallelEdge_PanicRecordedWithErrorRecorder(t *testing.T) {
+	g := langoraph.NewGraph[pState]()
+	g.AddNode("entry", func(_ context.Context, _ *pState) error { return nil })
+	g.AddNode("panic_branch", func(_ context.Context, _ *pState) error {
+		panic("record me")
+	})
+	g.AddNode("after", func(_ context.Context, s *pState) error {
+		atomic.AddInt64(&s.completed, 1)
+		return nil
+	})
+
+	g.AddEdge(langoraph.START, "entry")
+	g.AddParallelEdge("entry", []string{"panic_branch"}, "after")
+	g.AddEdge("after", langoraph.END)
+
+	state := &pState{}
+	if err := g.Run(context.Background(), state); err != nil {
+		t.Fatalf("expected recorder mode to continue, got %v", err)
+	}
+	if state.completed != 1 {
+		t.Fatalf("expected after node to run, got completed=%d", state.completed)
+	}
+	if len(state.errors) != 1 || !contains(state.errors[0], "panic_branch: node \"panic_branch\" panic: record me") {
+		t.Fatalf("unexpected recorded errors: %+v", state.errors)
 	}
 }
 

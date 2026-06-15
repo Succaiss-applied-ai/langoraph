@@ -9,15 +9,15 @@
 // Each Client supports both modes. The active mode for a single call
 // is resolved from (highest precedence first):
 //
-//  1. “WithStream(true|false)“ option passed at the call site.
-//  2. “Config.Stream“ set when the Client was built with NewClient.
-//  3. Default of “false“ (a single non-streaming round-trip).
+//  1. `WithStream(true|false)` option passed at the call site.
+//  2. `Config.Stream` set when the Client was built with NewClient.
+//  3. Default of `false` (a single non-streaming round-trip).
 //
 // For DashScope/DeepSeek "thinking" models, streaming mode is the only
 // safe choice — non-streaming requests sit on the connection until the
 // model finishes thinking, often exceeding the HTTP timeout. Streaming
 // mode runs a first-token watchdog that recognises the
-// “reasoning_content“ heartbeat as proof-of-life so reasoning bursts
+// `reasoning_content` heartbeat as proof-of-life so reasoning bursts
 // do not falsely time out.
 package llm
 
@@ -87,10 +87,12 @@ type openAIClient struct {
 	defaultSeed                 *int
 	defaultMaxTokens            *int
 	defaultEnableThinking       bool
+	defaultThinkingBudget       *int
 	defaultReasoningEffort      string
 	defaultStream               bool
 	defaultFirstTokenTimeout    time.Duration
 	defaultFirstTokenMaxRetries int
+	defaultChunkIdleTimeout     time.Duration
 
 	httpClient *http.Client
 }
@@ -111,6 +113,8 @@ type chatRequest struct {
 	// Sending it nested under "extra_body" is silently ignored by DashScope, causing the model
 	// to default to thinking=true and generate thousands of slow reasoning tokens.
 	EnableThinking *bool `json:"enable_thinking,omitempty"`
+	// ThinkingBudget is a DashScope/Ark extension consumed by Qwen thinking models.
+	ThinkingBudget *int `json:"thinking_budget,omitempty"`
 	// ReasoningEffort is a DashScope/DeepSeek top-level extension for DeepSeek thinking depth.
 	ReasoningEffort *string `json:"reasoning_effort,omitempty"`
 }
@@ -187,6 +191,7 @@ func newOpenAIClient(baseURL, apiKey, model string, cfg Config) *openAIClient {
 		defaultStream:               cfg.Stream,
 		defaultFirstTokenTimeout:    cfg.FirstTokenTimeout,
 		defaultFirstTokenMaxRetries: cfg.FirstTokenMaxRetries,
+		defaultChunkIdleTimeout:     cfg.ChunkIdleTimeout,
 		// No Timeout on the http.Client itself: callers pass a context with deadline,
 		// which is the correct Go idiom.  Setting Timeout here would race with the
 		// context deadline and produce confusing error messages.
@@ -203,6 +208,10 @@ func newOpenAIClient(baseURL, apiKey, model string, cfg Config) *openAIClient {
 	if cfg.MaxTokens > 0 {
 		v := cfg.MaxTokens
 		c.defaultMaxTokens = &v
+	}
+	if cfg.ThinkingBudget > 0 {
+		v := cfg.ThinkingBudget
+		c.defaultThinkingBudget = &v
 	}
 	return c
 }
@@ -248,12 +257,20 @@ func (c *openAIClient) buildRequest(messages []Message, o chatOpts) chatRequest 
 	// Nesting it under "extra_body" key is silently ignored by DashScope, causing
 	// qwen3.5-flash to default to thinking=true and generate ~5000 slow reasoning tokens.
 	lower := strings.ToLower(c.baseURL)
-	if strings.Contains(lower, "dashscope") || strings.Contains(lower, "deepseek") {
+	if isThinkingExtensionEndpoint(lower) {
 		t := c.defaultEnableThinking
 		if o.enableThinking != nil {
 			t = *o.enableThinking
 		}
 		req.EnableThinking = &t
+		if t {
+			if budget := c.defaultThinkingBudget; budget != nil {
+				req.ThinkingBudget = budget
+			}
+			if o.thinkingBudget != nil && *o.thinkingBudget > 0 {
+				req.ThinkingBudget = o.thinkingBudget
+			}
+		}
 		if effort := c.defaultReasoningEffort; effort != "" {
 			req.ReasoningEffort = &effort
 		}
@@ -266,16 +283,23 @@ func (c *openAIClient) buildRequest(messages []Message, o chatOpts) chatRequest 
 		t := *o.enableThinking
 		req.EnableThinking = &t
 	}
-	if !strings.Contains(lower, "dashscope") && !strings.Contains(lower, "deepseek") && o.reasoningEffort != nil {
+	if !isThinkingExtensionEndpoint(lower) && o.reasoningEffort != nil {
 		req.ReasoningEffort = o.reasoningEffort
 	}
 	return req
 }
 
+func isThinkingExtensionEndpoint(lowerBaseURL string) bool {
+	return strings.Contains(lowerBaseURL, "dashscope") ||
+		strings.Contains(lowerBaseURL, "deepseek") ||
+		strings.Contains(lowerBaseURL, "ark") ||
+		strings.Contains(lowerBaseURL, "volces")
+}
+
 // resolveStreamWatchdog returns the effective first-token timeout +
 // retry budget for a streaming call, applying per-call overrides on
 // top of the client defaults.
-func (c *openAIClient) resolveStreamWatchdog(o chatOpts) (timeout time.Duration, retries int) {
+func (c *openAIClient) resolveStreamWatchdog(o chatOpts) (timeout time.Duration, retries int, chunkIdleTimeout time.Duration) {
 	timeout = c.defaultFirstTokenTimeout
 	if o.firstTokenTimeout != nil {
 		timeout = *o.firstTokenTimeout
@@ -287,7 +311,11 @@ func (c *openAIClient) resolveStreamWatchdog(o chatOpts) (timeout time.Duration,
 	if retries < 0 {
 		retries = 0
 	}
-	return timeout, retries
+	chunkIdleTimeout = c.defaultChunkIdleTimeout
+	if o.chunkIdleTimeout != nil {
+		chunkIdleTimeout = *o.chunkIdleTimeout
+	}
+	return timeout, retries, chunkIdleTimeout
 }
 
 func (c *openAIClient) chat(ctx context.Context, messages []Message, jsonMode bool, opts []ChatOption) (*Response, error) {
@@ -297,8 +325,8 @@ func (c *openAIClient) chat(ctx context.Context, messages []Message, jsonMode bo
 		req.ResponseFormat = &responseFormat{Type: "json_object"}
 	}
 	if req.Stream {
-		ftt, ftMaxRetries := c.resolveStreamWatchdog(o)
-		return c.chatStream(ctx, req, ftt, ftMaxRetries)
+		ftt, ftMaxRetries, chunkIdleTimeout := c.resolveStreamWatchdog(o)
+		return c.chatStream(ctx, req, ftt, ftMaxRetries, chunkIdleTimeout)
 	}
 	return c.chatNonStream(ctx, req)
 }
@@ -324,7 +352,7 @@ func (c *openAIClient) chatNonStream(ctx context.Context, req chatRequest) (*Res
 	if err != nil {
 		return nil, fmt.Errorf("llm: http request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -383,8 +411,8 @@ func (c *openAIClient) ChatSchema(ctx context.Context, messages []Message, schem
 		},
 	}
 	if req.Stream {
-		ftt, ftMaxRetries := c.resolveStreamWatchdog(o)
-		return c.chatStream(ctx, req, ftt, ftMaxRetries)
+		ftt, ftMaxRetries, chunkIdleTimeout := c.resolveStreamWatchdog(o)
+		return c.chatStream(ctx, req, ftt, ftMaxRetries, chunkIdleTimeout)
 	}
 	return c.chatNonStream(ctx, req)
 }
@@ -392,7 +420,9 @@ func (c *openAIClient) ChatSchema(ctx context.Context, messages []Message, schem
 // ---- Factory ----
 
 type providerConfig struct {
-	apiKeyEnv    string
+	name         string
+	aliases      []string
+	apiKeyEnvs   []string
 	baseURLEnv   string
 	defaultURL   string
 	modelEnv     string
@@ -401,33 +431,53 @@ type providerConfig struct {
 
 var providers = []providerConfig{
 	{
-		apiKeyEnv:    "DASHSCOPE_API_KEY",
+		name:         "dashscope",
+		aliases:      []string{"dashscope", "qwen"},
+		apiKeyEnvs:   []string{"DASHSCOPE_API_KEY"},
 		baseURLEnv:   "DASHSCOPE_BASE_URL",
 		defaultURL:   "https://dashscope.aliyuncs.com/compatible-mode/v1",
 		modelEnv:     "DASHSCOPE_MODEL",
 		defaultModel: "qwen-plus",
 	},
 	{
-		apiKeyEnv:    "DEEPSEEK_API_KEY",
-		baseURLEnv:   "DEEPSEEK_BASE_URL",
-		defaultURL:   "https://api.deepseek.com",
+		name:         "deepseek",
+		aliases:      []string{"deepseek"},
+		apiKeyEnvs:   []string{"DASHSCOPE_API_KEY"},
+		baseURLEnv:   "DASHSCOPE_BASE_URL",
+		defaultURL:   "https://dashscope.aliyuncs.com/compatible-mode/v1",
 		defaultModel: "deepseek-chat",
 	},
 	{
-		apiKeyEnv:    "OPENAI_API_KEY",
+		name:         "openai",
+		aliases:      []string{"openai", "gpt"},
+		apiKeyEnvs:   []string{"OPENAI_API_KEY"},
 		baseURLEnv:   "OPENAI_BASE_URL",
 		defaultURL:   "https://api.openai.com/v1",
 		defaultModel: "gpt-4o-mini",
+	},
+	{
+		name:         "ark",
+		aliases:      []string{"ark", "doubao"},
+		apiKeyEnvs:   []string{"ARK_API_KEY", "REVIEW_ARK_API_KEY"},
+		baseURLEnv:   "ARK_BASE_URL",
+		defaultURL:   "https://ark.cn-beijing.volces.com/api/v3",
+		modelEnv:     "ARK_MODEL",
+		defaultModel: "doubao-seed-2-0-pro-260215",
 	},
 }
 
 // Config holds LLM client configuration.
 type Config struct {
 	Provider       string // "dashscope" | "deepseek" | "openai" | "" (auto)
+	BaseURL        string // explicit OpenAI-compatible base URL; falls back to provider env/default
+	APIKey         string // explicit API key; falls back to provider env
 	Model          string // override model name
 	Temperature    float64
 	TimeoutSeconds int
 	EnableThinking bool
+	// ThinkingBudget is sent as DashScope/Ark top-level thinking_budget when
+	// EnableThinking is true and the value is positive.
+	ThinkingBudget int
 	// ReasoningEffort is sent as DashScope/DeepSeek top-level reasoning_effort
 	// when non-empty, e.g. "low", "medium", or "high".
 	ReasoningEffort string
@@ -449,6 +499,9 @@ type Config struct {
 	// attempts on a first-token timeout before the timeout bubbles up
 	// (matches Python's ``llm_first_token_max_retries``).
 	FirstTokenMaxRetries int
+	// ChunkIdleTimeout caps the allowed silence between successive SSE
+	// chunks. This mirrors Python httpx read_timeout semantics.
+	ChunkIdleTimeout time.Duration
 
 	// --- Sampling defaults (per-call WithTopP / WithSeed /
 	//     WithMaxTokens override these) ---
@@ -463,28 +516,52 @@ type Config struct {
 	MaxTokens int
 }
 
-// NewClient returns a Client based on available environment variables.
-// Provider priority when Config.Provider is empty: DashScope → DeepSeek → OpenAI.
+// NewClient returns a Client based on explicit Config credentials or env vars.
+// Provider priority when Config.Provider is empty: DashScope → DeepSeek → OpenAI → Ark.
 func NewClient(cfg Config) (Client, error) {
 	if cfg.TimeoutSeconds <= 0 {
 		cfg.TimeoutSeconds = 60
 	}
 
 	requested := strings.ToLower(strings.TrimSpace(cfg.Provider))
+	explicitAPIKey := cleanString(cfg.APIKey)
+	explicitBaseURL := cleanString(cfg.BaseURL)
+
+	if explicitAPIKey != "" || explicitBaseURL != "" {
+		p := providerForExplicitConfig(requested, explicitBaseURL)
+		if p == nil {
+			return nil, fmt.Errorf("llm: unsupported provider %q", requested)
+		}
+		apiKey := explicitAPIKey
+		if apiKey == "" {
+			apiKey = firstCleanEnv(p.apiKeyEnvs...)
+		}
+		if apiKey == "" {
+			return nil, fmt.Errorf("llm: explicit base URL selected but no API key configured for provider %q", p.name)
+		}
+		baseURL := explicitBaseURL
+		if baseURL == "" {
+			baseURL = cleanEnv(p.baseURLEnv)
+		}
+		if baseURL == "" {
+			baseURL = p.defaultURL
+		}
+		model := resolvedModel(cfg.Model, p)
+		slog.Info("llm: using explicit provider config", "provider", p.name, "base_url", baseURL, "model", model, "stream", cfg.Stream)
+		cfg.Model = model
+		return newOpenAIClient(baseURL, apiKey, model, cfg), nil
+	}
 
 	for _, p := range providers {
 		// Skip providers that don't match the explicit request.
-		if requested != "" {
-			pName := strings.ToLower(strings.Split(p.apiKeyEnv, "_")[0])
-			if !strings.HasPrefix(pName, requested) {
-				continue
-			}
+		if requested != "" && !p.matches(requested) {
+			continue
 		}
 
-		apiKey := cleanEnv(p.apiKeyEnv)
+		apiKey := firstCleanEnv(p.apiKeyEnvs...)
 		if apiKey == "" {
 			if requested != "" {
-				return nil, fmt.Errorf("llm: provider %q selected but %s is not set", requested, p.apiKeyEnv)
+				return nil, fmt.Errorf("llm: provider %q selected but API key env is not set", requested)
 			}
 			continue
 		}
@@ -494,24 +571,91 @@ func NewClient(cfg Config) (Client, error) {
 			baseURL = p.defaultURL
 		}
 
-		model := cfg.Model
-		if model == "" {
-			model = cleanEnv(p.modelEnv)
-		}
-		if model == "" {
-			model = p.defaultModel
-		}
+		model := resolvedModel(cfg.Model, &p)
 
-		slog.Info("llm: using provider", "base_url", baseURL, "model", model, "stream", cfg.Stream)
+		slog.Info("llm: using provider", "provider", p.name, "base_url", baseURL, "model", model, "stream", cfg.Stream)
 		// Capture the resolved model on the cfg copy so newOpenAIClient
 		// records it alongside the user-supplied defaults.
 		cfg.Model = model
 		return newOpenAIClient(baseURL, apiKey, model, cfg), nil
 	}
 
-	return nil, fmt.Errorf("llm: no API key found; set DASHSCOPE_API_KEY, DEEPSEEK_API_KEY, or OPENAI_API_KEY")
+	return nil, fmt.Errorf("llm: no API key found; set DASHSCOPE_API_KEY, OPENAI_API_KEY, or ARK_API_KEY")
 }
 
 func cleanEnv(name string) string {
-	return strings.Trim(strings.TrimSpace(os.Getenv(name)), `"'`)
+	return cleanString(os.Getenv(name))
+}
+
+func cleanString(value string) string {
+	return strings.Trim(strings.TrimSpace(value), `"'`)
+}
+
+func firstCleanEnv(names ...string) string {
+	for _, name := range names {
+		if value := cleanEnv(name); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func resolvedModel(override string, p *providerConfig) string {
+	model := cleanString(override)
+	if model != "" {
+		return model
+	}
+	if p != nil && p.modelEnv != "" {
+		model = cleanEnv(p.modelEnv)
+	}
+	if model != "" {
+		return model
+	}
+	if p != nil {
+		return p.defaultModel
+	}
+	return ""
+}
+
+func providerForExplicitConfig(requested, baseURL string) *providerConfig {
+	if requested != "" {
+		for i := range providers {
+			if providers[i].matches(requested) {
+				return &providers[i]
+			}
+		}
+		return nil
+	}
+	baseURL = strings.ToLower(baseURL)
+	for i := range providers {
+		if providers[i].baseURLMatches(baseURL) {
+			return &providers[i]
+		}
+	}
+	return &providers[0]
+}
+
+func (p providerConfig) matches(requested string) bool {
+	for _, alias := range p.aliases {
+		if requested == alias {
+			return true
+		}
+	}
+	return false
+}
+
+func (p providerConfig) baseURLMatches(baseURL string) bool {
+	if baseURL == "" {
+		return false
+	}
+	switch p.name {
+	case "dashscope", "deepseek":
+		return strings.Contains(baseURL, "dashscope")
+	case "openai":
+		return strings.Contains(baseURL, "openai")
+	case "ark":
+		return strings.Contains(baseURL, "ark") || strings.Contains(baseURL, "volces")
+	default:
+		return false
+	}
 }

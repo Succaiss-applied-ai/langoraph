@@ -19,13 +19,13 @@ type ItemFunc[Item, Output any] func(ctx context.Context, item Item) (Output, er
 // Parallel semantics — DELIBERATELY MATCHES LangGraph
 // ---------------------------------------------------
 // Every goroutine runs to its natural completion regardless of sibling
-// failures. The shared ``ctx`` is **never** cancelled by Fanout itself
+// failures. The shared `ctx` is **never** cancelled by Fanout itself
 // (callers can still cancel it externally). After all goroutines have
 // returned, Fanout returns the first non-nil error encountered, in the
 // order items appear in the input slice — making the returned error
 // deterministic across runs.
 //
-// This mirrors Python's ``asyncio.gather(*coros, return_exceptions=False)``
+// This mirrors Python's `asyncio.gather(*coros, return_exceptions=False)`
 // behaviour at the time the awaiter raises: the gather call propagates
 // the first exception, but **does not** cancel sibling tasks. We extend
 // that contract slightly by waiting for siblings to finish before
@@ -44,6 +44,11 @@ func Fanout[Item, Output any](ctx context.Context, items []Item, fn ItemFunc[Ite
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					errs[i] = recoveredPanicError("fanout branch", r)
+				}
+			}()
 			out, err := fn(ctx, item)
 			if err != nil {
 				errs[i] = err

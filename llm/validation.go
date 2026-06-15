@@ -10,7 +10,7 @@ import (
 // SchemaMode tags which response_format strictness tier carried a
 // structured-output call, so callers can record observability traces.
 //
-// Mirrors Python's ``rf_mode`` from ``call_llm_json_with_validation``.
+// Mirrors Python's `rf_mode` from `call_llm_json_with_validation`.
 type SchemaMode string
 
 const (
@@ -23,7 +23,7 @@ const (
 // ValidatorVerdict is what a Validator returns about one LLM payload.
 //
 // Field semantics — exactly mirrors Python's
-// ``(is_valid, normalised_payload, feedback_for_next_turn_or_None)``:
+// `(is_valid, normalised_payload, feedback_for_next_turn_or_None)`:
 //
 //   - OK=true: the validator accepted Normalised. No retry occurs;
 //     the helper returns Normalised immediately.
@@ -60,23 +60,23 @@ type ValidatedOutcome[T any] struct {
 // ChatStructuredWithFeedback drives a Python-style validation retry
 // loop on top of the LLM client.
 //
-// Behaviour, mirroring ``call_llm_json_with_validation``:
+// Behaviour, mirroring `call_llm_json_with_validation`:
 //
-//  1. Send ``messages`` once. If ``schema`` is non-nil, use ChatSchema
+//  1. Send `messages` once. If `schema` is non-nil, use ChatSchema
 //     (json_schema response_format); otherwise use ChatJSON
 //     (json_object). Streaming is honoured automatically when the
 //     client (or per-call ChatOption) sets it.
 //  2. Extract a JSON object from the response, json.Unmarshal it, then
-//     hand the parsed map to ``validator``.
+//     hand the parsed map to `validator`.
 //  3. If the verdict is OK or the validator chose not to provide
 //     feedback (Feedback==""), return immediately.
-//  4. Otherwise append an ``assistant`` turn carrying the previous raw
-//     output (truncated to 2000 runes to mirror Python) and a ``user``
+//  4. Otherwise append an `assistant` turn carrying the previous raw
+//     output (truncated to 2000 runes to mirror Python) and a `user`
 //     turn carrying the validator's feedback, then re-prompt. Repeat
-//     up to ``maxRetries`` times.
+//     up to `maxRetries` times.
 //
 // On exhaustion the most recently normalised payload is returned with
-// ``RetryCount`` reflecting how many feedback-retries actually fired.
+// `RetryCount` reflecting how many feedback-retries actually fired.
 //
 // Goroutine safety: the helper holds no shared state — every call gets
 // its own message buffer and option set, so multiple concurrent

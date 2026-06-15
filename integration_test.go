@@ -42,7 +42,9 @@ func loadEnvForIntegration(t *testing.T) {
 				key := strings.TrimSpace(parts[0])
 				val := strings.Trim(strings.TrimSpace(parts[1]), `"'`)
 				if os.Getenv(key) == "" {
-					os.Setenv(key, val)
+					if err := os.Setenv(key, val); err != nil {
+						t.Fatalf("set env %s: %v", key, err)
+					}
 				}
 			}
 		}
