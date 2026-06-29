@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -202,6 +203,73 @@ func TestOptions_OmitsZeroDefaults(t *testing.T) {
 	}
 	if _, ok := body["max_tokens"]; ok {
 		t.Errorf("max_tokens should be omitted when zero, got %v", body["max_tokens"])
+	}
+}
+
+func TestTokenPlanChatJSONUsesPromptJSONMode(t *testing.T) {
+	srv, rec := captureServer(t)
+	c := stubClient(t, srv.URL+"/tokenhub.tencentmaas.com", Config{})
+
+	if _, err := c.ChatJSON(context.Background(), []Message{{Role: "user", Content: "hi"}}); err != nil {
+		t.Fatalf("ChatJSON failed: %v", err)
+	}
+	body := rec.last()
+	if _, ok := body["response_format"]; ok {
+		t.Fatalf("TokenPlan ChatJSON must not send response_format: %#v", body["response_format"])
+	}
+	messages := body["messages"].([]any)
+	if len(messages) < 2 {
+		t.Fatalf("messages length = %d, want at least 2", len(messages))
+	}
+	system := messages[0].(map[string]any)
+	if system["role"] != "system" {
+		t.Fatalf("first message role = %#v, want system", system["role"])
+	}
+	if got := system["content"].(string); !strings.Contains(got, "complete valid JSON object") {
+		t.Fatalf("JSON instruction missing: %q", got)
+	}
+}
+
+func TestTokenPlanChatSchemaUsesPromptSchemaMode(t *testing.T) {
+	srv, rec := captureServer(t)
+	c := stubClient(t, srv.URL+"/tencentmaas", Config{})
+	schema := map[string]any{
+		"type":     "object",
+		"required": []any{"answer"},
+		"properties": map[string]any{
+			"answer": map[string]any{"type": "string"},
+		},
+	}
+
+	if _, err := c.ChatSchema(context.Background(), []Message{{Role: "user", Content: "hi"}}, "answer_schema", schema); err != nil {
+		t.Fatalf("ChatSchema failed: %v", err)
+	}
+	body := rec.last()
+	if _, ok := body["response_format"]; ok {
+		t.Fatalf("TokenPlan ChatSchema must not send response_format: %#v", body["response_format"])
+	}
+	messages := body["messages"].([]any)
+	system := messages[0].(map[string]any)
+	content := system["content"].(string)
+	if !strings.Contains(content, "answer_schema") || !strings.Contains(content, "\"required\"") {
+		t.Fatalf("schema instruction missing: %q", content)
+	}
+}
+
+func TestDashScopeChatJSONKeepsResponseFormat(t *testing.T) {
+	srv, rec := captureServer(t)
+	c := stubClient(t, srv.URL+"/dashscope", Config{})
+
+	if _, err := c.ChatJSON(context.Background(), []Message{{Role: "user", Content: "hi"}}); err != nil {
+		t.Fatalf("ChatJSON failed: %v", err)
+	}
+	body := rec.last()
+	rf, ok := body["response_format"].(map[string]any)
+	if !ok {
+		t.Fatalf("DashScope ChatJSON should send response_format, body=%#v", body)
+	}
+	if rf["type"] != "json_object" {
+		t.Fatalf("response_format.type = %#v, want json_object", rf["type"])
 	}
 }
 

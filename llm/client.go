@@ -300,6 +300,35 @@ func isThinkingExtensionEndpoint(lowerBaseURL string) bool {
 		strings.Contains(lowerBaseURL, "volces")
 }
 
+func isTokenPlanEndpoint(lowerBaseURL string) bool {
+	return strings.Contains(lowerBaseURL, "tokenhub") ||
+		strings.Contains(lowerBaseURL, "tencentmaas")
+}
+
+func (c *openAIClient) supportsResponseFormat() bool {
+	return !isTokenPlanEndpoint(strings.ToLower(c.baseURL))
+}
+
+func withJSONOnlyInstruction(messages []Message, schemaName string, schema map[string]any) []Message {
+	instruction := "Return exactly one complete valid JSON object. Do not wrap it in markdown. Do not include prose before or after the JSON."
+	if schemaName != "" && schema != nil {
+		if schemaBytes, err := json.Marshal(schema); err == nil {
+			instruction += "\nThe JSON object must satisfy this schema named " + schemaName + ":\n" + string(schemaBytes)
+		}
+	}
+	out := make([]Message, 0, len(messages)+1)
+	if len(messages) > 0 && strings.EqualFold(strings.TrimSpace(messages[0].Role), "system") {
+		first := messages[0]
+		first.Content = strings.TrimSpace(first.Content) + "\n\n" + instruction
+		out = append(out, first)
+		out = append(out, messages[1:]...)
+		return out
+	}
+	out = append(out, Message{Role: "system", Content: instruction})
+	out = append(out, messages...)
+	return out
+}
+
 // resolveStreamWatchdog returns the effective first-token timeout +
 // retry budget for a streaming call, applying per-call overrides on
 // top of the client defaults.
@@ -324,8 +353,11 @@ func (c *openAIClient) resolveStreamWatchdog(o chatOpts) (timeout time.Duration,
 
 func (c *openAIClient) chat(ctx context.Context, messages []Message, jsonMode bool, opts []ChatOption) (*Response, error) {
 	o := applyOptions(opts)
+	if jsonMode && !c.supportsResponseFormat() {
+		messages = withJSONOnlyInstruction(messages, "", nil)
+	}
 	req := c.buildRequest(messages, o)
-	if jsonMode {
+	if jsonMode && c.supportsResponseFormat() {
 		req.ResponseFormat = &responseFormat{Type: "json_object"}
 	}
 	if req.Stream {
@@ -406,6 +438,14 @@ func (c *openAIClient) ChatJSON(ctx context.Context, messages []Message, opts ..
 
 func (c *openAIClient) ChatSchema(ctx context.Context, messages []Message, schemaName string, schema map[string]any, opts ...ChatOption) (*Response, error) {
 	o := applyOptions(opts)
+	if !c.supportsResponseFormat() {
+		req := c.buildRequest(withJSONOnlyInstruction(messages, schemaName, schema), o)
+		if req.Stream {
+			ftt, ftMaxRetries, chunkIdleTimeout := c.resolveStreamWatchdog(o)
+			return c.chatStream(ctx, req, ftt, ftMaxRetries, chunkIdleTimeout)
+		}
+		return c.chatNonStream(ctx, req)
+	}
 	req := c.buildRequest(messages, o)
 	req.ResponseFormat = &responseFormat{
 		Type: "json_schema",
