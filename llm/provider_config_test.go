@@ -6,7 +6,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
+	"time"
 )
 
 func providerCaptureServer(t *testing.T) (*httptest.Server, *providerRecorder) {
@@ -120,6 +122,35 @@ func TestNewClientDeepSeekUsesDashScopeCompatibleEndpoint(t *testing.T) {
 	}
 }
 
+func TestNewClientTokenPlanUsesEnv(t *testing.T) {
+	srv, rec := providerCaptureServer(t)
+	t.Setenv("TOKENPLAN_API_KEY", "tokenplan-key")
+	t.Setenv("TOKENPLAN_BASE_URL", srv.URL)
+	t.Setenv("TOKENPLAN_MODEL", "deepseek-v4-flash-202605")
+
+	client, err := NewClient(Config{Provider: "tokenplan"})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	if _, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "hi"}}); err != nil {
+		t.Fatalf("Chat() error = %v", err)
+	}
+
+	if rec.lastAuthorization() != "Bearer tokenplan-key" {
+		t.Fatalf("Authorization = %q", rec.lastAuthorization())
+	}
+	if got := rec.lastRequest()["model"]; got != "deepseek-v4-flash-202605" {
+		t.Fatalf("model = %v, want deepseek-v4-flash-202605", got)
+	}
+}
+
+func TestTokenPlanBaseURLSelectsTokenPlanProvider(t *testing.T) {
+	p := providerForExplicitConfig("", "https://tokenhub.tencentmaas.com/plan/v3")
+	if p == nil || p.name != "tokenplan" {
+		t.Fatalf("provider = %#v, want tokenplan", p)
+	}
+}
+
 func TestArkEndpointGetsThinkingExtensions(t *testing.T) {
 	c := newOpenAIClient("https://ark.cn-beijing.volces.com/api/v3", "k", "m", Config{
 		EnableThinking:  true,
@@ -131,5 +162,45 @@ func TestArkEndpointGetsThinkingExtensions(t *testing.T) {
 	}
 	if req.ReasoningEffort == nil || *req.ReasoningEffort != "max" {
 		t.Fatalf("ReasoningEffort = %#v, want max", req.ReasoningEffort)
+	}
+}
+
+func TestTokenPlanEndpointGetsThinkingExtensions(t *testing.T) {
+	c := newOpenAIClient("https://tokenhub.tencentmaas.com/plan/v3", "k", "m", Config{
+		EnableThinking:  true,
+		ReasoningEffort: "high",
+	})
+	req := c.buildRequest([]Message{{Role: "user", Content: "hi"}}, applyOptions(nil))
+	if req.EnableThinking == nil || *req.EnableThinking != true {
+		t.Fatalf("EnableThinking = %#v, want true", req.EnableThinking)
+	}
+	if req.ReasoningEffort == nil || *req.ReasoningEffort != "high" {
+		t.Fatalf("ReasoningEffort = %#v, want high", req.ReasoningEffort)
+	}
+}
+
+func TestLiveTokenPlanDeepSeek(t *testing.T) {
+	if os.Getenv("RUN_TOKENPLAN_LIVE") != "1" {
+		t.Skip("set RUN_TOKENPLAN_LIVE=1 and TOKENPLAN_API_KEY or TENCENT_TOKENPLAN_API_KEY")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	client, err := NewClient(Config{
+		Provider:       "tokenplan",
+		TimeoutSeconds: 45,
+		Temperature:    0,
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+
+	resp, err := client.Chat(ctx, []Message{{Role: "user", Content: "reply with ok"}})
+	if err != nil {
+		t.Fatalf("Chat() error = %v", err)
+	}
+	if resp == nil || resp.Content == "" {
+		t.Fatalf("empty response: %#v", resp)
 	}
 }

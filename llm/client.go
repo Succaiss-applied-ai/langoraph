@@ -1,5 +1,5 @@
 // Package llm provides a unified LLM client interface and OpenAI-compatible
-// implementations for DashScope (Qwen), DeepSeek, and OpenAI.
+// implementations for DashScope (Qwen), DeepSeek, Tencent TokenPlan, and OpenAI.
 //
 // All providers share the same OpenAI Chat Completions wire format;
 // only the base URL and API key differ.
@@ -13,7 +13,7 @@
 //  2. `Config.Stream` set when the Client was built with NewClient.
 //  3. Default of `false` (a single non-streaming round-trip).
 //
-// For DashScope/DeepSeek "thinking" models, streaming mode is the only
+// For DashScope/DeepSeek/TokenPlan "thinking" models, streaming mode is the only
 // safe choice — non-streaming requests sit on the connection until the
 // model finishes thinking, often exceeding the HTTP timeout. Streaming
 // mode runs a first-token watchdog that recognises the
@@ -155,6 +155,8 @@ func providerRequestID(headers http.Header) string {
 		"x-request-id",
 		"x-dashscope-request-id",
 		"x-acs-request-id",
+		"x-tc-requestid",
+		"x-tc-request-id",
 		"request-id",
 	} {
 		if value := strings.TrimSpace(headers.Get(name)); value != "" {
@@ -252,7 +254,7 @@ func (c *openAIClient) buildRequest(messages []Message, o chatOpts) chatRequest 
 		req.StreamOptions = &streamOptions{IncludeUsage: true}
 	}
 
-	// DashScope / DeepSeek: send thinking controls as TOP-LEVEL fields.
+	// DashScope / DeepSeek / TokenPlan: send thinking controls as TOP-LEVEL fields.
 	// Python's openai SDK extra_body merges into top-level — we must do the same.
 	// Nesting it under "extra_body" key is silently ignored by DashScope, causing
 	// qwen3.5-flash to default to thinking=true and generate ~5000 slow reasoning tokens.
@@ -292,6 +294,8 @@ func (c *openAIClient) buildRequest(messages []Message, o chatOpts) chatRequest 
 func isThinkingExtensionEndpoint(lowerBaseURL string) bool {
 	return strings.Contains(lowerBaseURL, "dashscope") ||
 		strings.Contains(lowerBaseURL, "deepseek") ||
+		strings.Contains(lowerBaseURL, "tokenhub") ||
+		strings.Contains(lowerBaseURL, "tencentmaas") ||
 		strings.Contains(lowerBaseURL, "ark") ||
 		strings.Contains(lowerBaseURL, "volces")
 }
@@ -423,7 +427,7 @@ type providerConfig struct {
 	name         string
 	aliases      []string
 	apiKeyEnvs   []string
-	baseURLEnv   string
+	baseURLEnvs  []string
 	defaultURL   string
 	modelEnv     string
 	defaultModel string
@@ -434,7 +438,7 @@ var providers = []providerConfig{
 		name:         "dashscope",
 		aliases:      []string{"dashscope", "qwen"},
 		apiKeyEnvs:   []string{"DASHSCOPE_API_KEY"},
-		baseURLEnv:   "DASHSCOPE_BASE_URL",
+		baseURLEnvs:  []string{"DASHSCOPE_BASE_URL"},
 		defaultURL:   "https://dashscope.aliyuncs.com/compatible-mode/v1",
 		modelEnv:     "DASHSCOPE_MODEL",
 		defaultModel: "qwen-plus",
@@ -443,15 +447,24 @@ var providers = []providerConfig{
 		name:         "deepseek",
 		aliases:      []string{"deepseek"},
 		apiKeyEnvs:   []string{"DASHSCOPE_API_KEY"},
-		baseURLEnv:   "DASHSCOPE_BASE_URL",
+		baseURLEnvs:  []string{"DASHSCOPE_BASE_URL"},
 		defaultURL:   "https://dashscope.aliyuncs.com/compatible-mode/v1",
 		defaultModel: "deepseek-chat",
+	},
+	{
+		name:         "tokenplan",
+		aliases:      []string{"tokenplan", "tencent-tokenplan", "tencent_tokenplan"},
+		apiKeyEnvs:   []string{"TOKENPLAN_API_KEY", "TENCENT_TOKENPLAN_API_KEY"},
+		baseURLEnvs:  []string{"TOKENPLAN_BASE_URL", "TENCENT_TOKENPLAN_BASE_URL"},
+		defaultURL:   "https://tokenhub.tencentmaas.com/plan/v3",
+		modelEnv:     "TOKENPLAN_MODEL",
+		defaultModel: "deepseek-v4-flash-202605",
 	},
 	{
 		name:         "openai",
 		aliases:      []string{"openai", "gpt"},
 		apiKeyEnvs:   []string{"OPENAI_API_KEY"},
-		baseURLEnv:   "OPENAI_BASE_URL",
+		baseURLEnvs:  []string{"OPENAI_BASE_URL"},
 		defaultURL:   "https://api.openai.com/v1",
 		defaultModel: "gpt-4o-mini",
 	},
@@ -459,7 +472,7 @@ var providers = []providerConfig{
 		name:         "ark",
 		aliases:      []string{"ark", "doubao"},
 		apiKeyEnvs:   []string{"ARK_API_KEY", "REVIEW_ARK_API_KEY"},
-		baseURLEnv:   "ARK_BASE_URL",
+		baseURLEnvs:  []string{"ARK_BASE_URL"},
 		defaultURL:   "https://ark.cn-beijing.volces.com/api/v3",
 		modelEnv:     "ARK_MODEL",
 		defaultModel: "doubao-seed-2-0-pro-260215",
@@ -468,7 +481,7 @@ var providers = []providerConfig{
 
 // Config holds LLM client configuration.
 type Config struct {
-	Provider       string // "dashscope" | "deepseek" | "openai" | "" (auto)
+	Provider       string // "dashscope" | "deepseek" | "tokenplan" | "openai" | "" (auto)
 	BaseURL        string // explicit OpenAI-compatible base URL; falls back to provider env/default
 	APIKey         string // explicit API key; falls back to provider env
 	Model          string // override model name
@@ -517,7 +530,7 @@ type Config struct {
 }
 
 // NewClient returns a Client based on explicit Config credentials or env vars.
-// Provider priority when Config.Provider is empty: DashScope → DeepSeek → OpenAI → Ark.
+// Provider priority when Config.Provider is empty: DashScope → DeepSeek → TokenPlan → OpenAI → Ark.
 func NewClient(cfg Config) (Client, error) {
 	if cfg.TimeoutSeconds <= 0 {
 		cfg.TimeoutSeconds = 60
@@ -541,7 +554,7 @@ func NewClient(cfg Config) (Client, error) {
 		}
 		baseURL := explicitBaseURL
 		if baseURL == "" {
-			baseURL = cleanEnv(p.baseURLEnv)
+			baseURL = firstCleanEnv(p.baseURLEnvs...)
 		}
 		if baseURL == "" {
 			baseURL = p.defaultURL
@@ -566,7 +579,7 @@ func NewClient(cfg Config) (Client, error) {
 			continue
 		}
 
-		baseURL := cleanEnv(p.baseURLEnv)
+		baseURL := firstCleanEnv(p.baseURLEnvs...)
 		if baseURL == "" {
 			baseURL = p.defaultURL
 		}
@@ -580,7 +593,7 @@ func NewClient(cfg Config) (Client, error) {
 		return newOpenAIClient(baseURL, apiKey, model, cfg), nil
 	}
 
-	return nil, fmt.Errorf("llm: no API key found; set DASHSCOPE_API_KEY, OPENAI_API_KEY, or ARK_API_KEY")
+	return nil, fmt.Errorf("llm: no API key found; set DASHSCOPE_API_KEY, TOKENPLAN_API_KEY, OPENAI_API_KEY, or ARK_API_KEY")
 }
 
 func cleanEnv(name string) string {
@@ -651,6 +664,8 @@ func (p providerConfig) baseURLMatches(baseURL string) bool {
 	switch p.name {
 	case "dashscope", "deepseek":
 		return strings.Contains(baseURL, "dashscope")
+	case "tokenplan":
+		return strings.Contains(baseURL, "tokenhub") || strings.Contains(baseURL, "tencentmaas")
 	case "openai":
 		return strings.Contains(baseURL, "openai")
 	case "ark":
