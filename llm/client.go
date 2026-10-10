@@ -26,6 +26,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/Succaiss-applied-ai/langoraph/usage"
 	"io"
 	"log/slog"
 	"net/http"
@@ -182,6 +183,9 @@ var sharedTransport = &http.Transport{
 }
 
 func newOpenAIClient(baseURL, apiKey, model string, cfg Config) *openAIClient {
+	if resolved := providerForExplicitConfig(cfg.Provider, baseURL); resolved != nil {
+		cfg.Provider = resolved.name
+	}
 	c := &openAIClient{
 		baseURL:                     strings.TrimRight(baseURL, "/"),
 		apiKey:                      apiKey,
@@ -197,7 +201,7 @@ func newOpenAIClient(baseURL, apiKey, model string, cfg Config) *openAIClient {
 		// No Timeout on the http.Client itself: callers pass a context with deadline,
 		// which is the correct Go idiom.  Setting Timeout here would race with the
 		// context deadline and produce confusing error messages.
-		httpClient: &http.Client{Transport: sharedTransport},
+		httpClient: usage.Wrap(&http.Client{Transport: sharedTransport}, usage.Metadata{Provider: cfg.Provider, Model: model, Operation: "chat_completions"}, nil),
 	}
 	if cfg.TopP > 0 {
 		v := cfg.TopP
@@ -602,6 +606,7 @@ func NewClient(cfg Config) (Client, error) {
 		model := resolvedModel(cfg.Model, p)
 		slog.Info("llm: using explicit provider config", "provider", p.name, "base_url", baseURL, "model", model, "stream", cfg.Stream)
 		cfg.Model = model
+		cfg.Provider = p.name
 		return newOpenAIClient(baseURL, apiKey, model, cfg), nil
 	}
 
@@ -630,6 +635,7 @@ func NewClient(cfg Config) (Client, error) {
 		// Capture the resolved model on the cfg copy so newOpenAIClient
 		// records it alongside the user-supplied defaults.
 		cfg.Model = model
+		cfg.Provider = p.name
 		return newOpenAIClient(baseURL, apiKey, model, cfg), nil
 	}
 
